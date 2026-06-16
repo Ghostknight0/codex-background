@@ -174,7 +174,8 @@ try {
     }
 
     # Codex++ launcher 路径：未指定或不存在时自动探测。
-    # 方案 C 依赖 Codex++ 启动 Codex，故 Codex++ 是前置依赖。
+    # Codex++ 是可选依赖：找不到则回退到 MSIX 自激活（仅背景功能，无增强）。
+    $hasCodexPlus = $false
     if ([string]::IsNullOrWhiteSpace($CodexPlusLauncherPath) -or -not (Test-Path -LiteralPath $CodexPlusLauncherPath -PathType Leaf)) {
         if (-not [string]::IsNullOrWhiteSpace($CodexPlusLauncherPath)) {
             Write-Warning "指定的 Codex++ 主程序不存在，尝试自动探测：$CodexPlusLauncherPath"
@@ -182,10 +183,14 @@ try {
         $detected = Find-CodexPlusLauncher
         if ($detected) {
             $CodexPlusLauncherPath = $detected
+            $hasCodexPlus = $true
             Write-Host "已自动探测到 Codex++：$CodexPlusLauncherPath"
         } else {
-            throw "未找到 Codex++ 主程序（codex-plus-plus.exe）。本工具走 Codex++ launcher 启动 Codex，请先安装 Codex++，或用 -CodexPlusLauncherPath 手动指定路径。"
+            Write-Host "未检测到 Codex++，快捷方式将直接激活 Codex（仅背景功能，无增强）。如需增强功能请安装 Codex++。"
         }
+    }
+    else {
+        $hasCodexPlus = $true
     }
 
     if ([string]::IsNullOrWhiteSpace($PowerShellPath)) {
@@ -216,7 +221,7 @@ try {
 
     $resolvedLauncherPath = (Resolve-Path -LiteralPath $LauncherPath).Path
     $resolvedMediaDirectory = if ($MediaDirectory) { (Resolve-Path -LiteralPath $MediaDirectory).Path } else { "" }
-    $resolvedCodexPlusPath = (Resolve-Path -LiteralPath $CodexPlusLauncherPath).Path
+    $resolvedCodexPlusPath = if ($hasCodexPlus) { (Resolve-Path -LiteralPath $CodexPlusLauncherPath).Path } else { "" }
     $resolvedNativeLauncherSourcePath = (Resolve-Path -LiteralPath $NativeLauncherSourcePath).Path
     $resolvedPowerShellPath = (Resolve-Path -LiteralPath $PowerShellPath).Path
     $resolvedCSharpCompilerPath = (Resolve-Path -LiteralPath $CSharpCompilerPath).Path
@@ -281,15 +286,18 @@ try {
         }
     }
 
-    # 构造快捷方式完整参数：launcher.exe pwsh ps1 [模式/媒体] [透明度] [轮换] [端口] [Codex++路径] [压制开关]
+    # 构造快捷方式完整参数：launcher.exe pwsh ps1 [模式/媒体] [透明度] [轮换] [Codex++路径] [压制开关]
+    # Codex++ 路径仅在检测到 Codex++ 时写入；不写则核心脚本自动回退 MSIX 自激活。
     $fullArgs = (
         "`"$resolvedPowerShellPath`" " +
         "`"$resolvedLauncherPath`" " +
         "$modeArgs " +
         "$opacityArgs " +
-        "-RotateInterval $RotateInterval " +
-        "-CodexPlusLauncherPath `"$resolvedCodexPlusPath`""
+        "-RotateInterval $RotateInterval"
     )
+    if ($hasCodexPlus) {
+        $fullArgs += " -CodexPlusLauncherPath `"$resolvedCodexPlusPath`""
+    }
     if ($SuppressCodexPlus) {
         $fullArgs += " -SuppressCodexPlus"
     }
@@ -314,7 +322,11 @@ try {
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
 
     Write-Host "已创建 Codex 背景版快捷方式：$ShortcutPath"
-    Write-Host "Codex++ 主程序：$resolvedCodexPlusPath"
+    if ($hasCodexPlus) {
+        Write-Host "Codex++ 主程序：$resolvedCodexPlusPath（走 Codex++ 启动，含增强）"
+    } else {
+        Write-Host "启动方式：直接激活 Codex MSIX（无 Codex++，仅背景功能，无增强）"
+    }
     Write-Host "背景模式：$BackgroundMode"
     if ($BackgroundMode -eq "image") {
         Write-Host "图片：$resolvedMediaPath"

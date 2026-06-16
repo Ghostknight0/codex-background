@@ -45,6 +45,9 @@ param(
     # 不启动 Codex++/Codex，只连接已在跑的 CDP 端口注入（适合 Codex 已开的情况）。
     [switch]$NoLaunch,
 
+    # Codex MSIX 应用的 AUMID（无 Codex++ 时用于自激活 Codex）。留空则自动探测。
+    [string]$CodexAumid = "",
+
     # 仅验证参数和资源，不连接或启动 Codex。
     [switch]$ValidateOnly
 )
@@ -248,6 +251,118 @@ function Start-CodexViaLauncher {
 
     Write-Host "正在通过 Codex++ 启动 Codex：$LauncherPath"
     return Start-Process -FilePath $LauncherPath
+}
+
+function Stop-CodexProcesses {
+    # 优雅关闭当前所有 Codex 主进程（自激活前需重启 Codex 以附加 CDP 端口）。
+    # 只杀名为 Codex 的进程，不动其他程序。
+    $processes = @(Get-Process -Name "Codex" -ErrorAction SilentlyContinue)
+    if ($processes.Count -eq 0) { return }
+
+    Write-Host "正在关闭 Codex（重启以开启调试端口）..."
+    foreach ($process in $processes) {
+        if ($process.MainWindowHandle -ne 0) {
+            [void]$process.CloseMainWindow()
+        }
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    do {
+        Start-Sleep -Milliseconds 250
+        $remaining = @(Get-Process -Name "Codex" -ErrorAction SilentlyContinue)
+    } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+
+    if ($remaining.Count -gt 0) {
+        $remaining | Stop-Process -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $remaining.Id -Timeout 10 -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-CodexAumid {
+    param(
+        # 可选手动指定 AUMID，留空则自动探测。
+        [string]$Aumid = ""
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Aumid)) {
+        return $Aumid
+    }
+
+    # 动态探测：Get-AppxPackage 取 PackageFamilyName，拼成 AUMID（PackageFamilyName!App）。
+    $pkg = Get-AppxPackage -Name "OpenAI.Codex" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pkg -or -not $pkg.PackageFamilyName) {
+        throw "未找到 OpenAI.Codex MSIX 包。请从 Microsoft Store 安装 Codex 桌面版。"
+    }
+    return ($pkg.PackageFamilyName + "!App")
+}
+
+function Start-CodexViaMsix {
+    # 无 Codex++ 时的回退启动：用 COM IApplicationActivationManager 激活 Codex MSIX，
+    # 并附加 --remote-debugging-port 让 Codex 自己开启 CDP 端口（不依赖 Codex++）。
+    # CDP 端口只在进程启动时生效，故必须先关闭已运行的 Codex 再重新激活（会中断当前会话）。
+    param(
+        [Parameter(Mandatory)]
+        [int]$Port,
+
+        [string]$Aumid = ""
+    )
+
+    $resolvedAumid = Get-CodexAumid -Aumid $Aumid
+
+    # 先关闭已运行的 Codex（CDP 参数只在启动时生效）。
+    Stop-CodexProcesses
+    Start-Sleep -Milliseconds 500
+
+    # COM 激活的 C# 代码（GUID/CLSID 来自 IApplicationActivationManager 标准定义）。
+    $activationCode = @'
+using System;
+using System.Runtime.InteropServices;
+
+[Flags]
+public enum ActivateOptions {
+    None = 0x00000000,
+    DesignMode = 0x00000001,
+    NoErrorUI = 0x00000002,
+    NoSplashScreen = 0x00000004
+}
+
+[ComImport]
+[Guid("2e941141-7f97-4756-ba1d-9decde894a3d")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IApplicationActivationManager {
+    int ActivateApplication(
+        [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+        [MarshalAs(UnmanagedType.LPWStr)] string arguments,
+        ActivateOptions options,
+        out UInt32 processId);
+}
+
+[ComImport]
+[Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+class ApplicationActivationManager {}
+
+public static class CodexMsixActivator {
+    public static UInt32 Activate(string aumid, string arguments) {
+        var manager = (IApplicationActivationManager)new ApplicationActivationManager();
+        UInt32 pid;
+        int hr = manager.ActivateApplication(aumid, arguments, ActivateOptions.None, out pid);
+        Marshal.ThrowExceptionForHR(hr);
+        return pid;
+    }
+}
+'@
+
+    # 避免重复 Add-Type（同一 AppDomain 内只能定义一次）。
+    if (-not ("CodexMsixActivator" -as [type])) {
+        Add-Type -TypeDefinition $activationCode -Language CSharp
+    }
+
+    # 激活参数：开启 CDP 端口 + 允许回环 origin（Chromium 安全校验）。
+    $arguments = "--remote-debugging-port=$Port --remote-allow-origins=*"
+
+    Write-Host "正在直接激活 Codex（MSIX）：$resolvedAumid"
+    $codexPid = [CodexMsixActivator]::Activate($resolvedAumid, $arguments)
+    Write-Host "Codex 已激活（PID：$codexPid），等待 CDP 端口 $Port ..."
 }
 
 function Wait-CdpTargets {
@@ -877,33 +992,39 @@ try {
         exit 0
     }
 
-    # 1. 解析 Codex++ launcher 路径。
+    # 1. 探测 Codex++ launcher（可选，找不到不报错，回退到 MSIX 自激活）。
     $resolvedLauncherPath = ""
+    $hasCodexPlus = $false
     if (-not $NoLaunch) {
         if ([string]::IsNullOrWhiteSpace($CodexPlusLauncherPath)) {
             $resolvedLauncherPath = Find-CodexPlusLauncher
-            if (-not $resolvedLauncherPath) {
-                throw "未找到 Codex++ 主程序（codex-plus-plus.exe）。请用 -CodexPlusLauncherPath 手动指定，或先安装 Codex++。"
-            }
         }
-        else {
-            if (-not (Test-Path -LiteralPath $CodexPlusLauncherPath -PathType Leaf)) {
-                throw "Codex++ 主程序不存在：$CodexPlusLauncherPath"
-            }
+        elseif (Test-Path -LiteralPath $CodexPlusLauncherPath -PathType Leaf) {
             $resolvedLauncherPath = (Resolve-Path -LiteralPath $CodexPlusLauncherPath).Path
         }
+        else {
+            Write-Warning "指定的 Codex++ 主程序不存在，将回退到 MSIX 自激活：$CodexPlusLauncherPath"
+        }
+        $hasCodexPlus = [bool]$resolvedLauncherPath
     }
 
-    # 2. 检测 CDP 端口。
+    # 2. 检测 CDP 端口 + 启动（三分支）。
     $cdpReady = Test-CdpAvailable -Port $DebugPort
-    if (-not $cdpReady) {
-        if ($NoLaunch) {
-            throw "CDP 端口 $DebugPort 未在监听，且指定了 -NoLaunch 不启动 Codex。请先用 Codex++ 打开 Codex 后再运行。"
-        }
+    if ($cdpReady) {
+        Write-Host "检测到 Codex CDP 端口 $DebugPort 已在监听，直接注入（不重启 Codex）。"
+    }
+    elseif ($NoLaunch) {
+        throw "CDP 端口 $DebugPort 未在监听，且指定了 -NoLaunch 不启动 Codex。请先打开 Codex 后再运行。"
+    }
+    elseif ($hasCodexPlus) {
+        # 有 Codex++：走 Codex++ launcher（获得增强功能）。
         Start-CodexViaLauncher -LauncherPath $resolvedLauncherPath | Out-Null
     }
     else {
-        Write-Host "检测到 Codex CDP 端口 $DebugPort 已在监听，直接注入（不重启 Codex）。"
+        # 无 Codex++：直接激活 Codex MSIX 并附加 CDP 端口（重启 Codex，无增强功能）。
+        Write-Host "未检测到 Codex++，将直接激活 Codex（仅背景功能，无增强）。如需增强功能请安装 Codex++。"
+        Write-Host "⚠️ 这会重启 Codex，当前会话将中断。"
+        Start-CodexViaMsix -Port $DebugPort -Aumid $CodexAumid
     }
 
     # 3. 等待 CDP 主窗口 target。
