@@ -22,6 +22,7 @@ internal static class CodexBackgroundLauncher
             var powerShellArguments = new List<string>
             {
                 "-NoProfile",
+                "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
@@ -40,12 +41,18 @@ internal static class CodexBackgroundLauncher
                 Arguments = BuildCommandLine(powerShellArguments),
                 WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? Environment.CurrentDirectory,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                // launcher 是无控制台 winexe；关闭 stdin 让 -NonInteractive 的 pwsh
+                // 知道没有交互输入，避免 "Input redirection is not supported" 退出。
+                RedirectStandardInput = true
             };
 
             using (Process process = Process.Start(startInfo))
             {
-                return process == null ? 3 : 0;
+                if (process == null) return 3;
+                try { process.StandardInput.Close(); } catch {}
+                // 不阻塞等待：launcher 拉起 pwsh 后即可退出，pwsh 作为独立进程继续常驻。
+                return 0;
             }
         }
         catch
