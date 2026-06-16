@@ -410,9 +410,8 @@ function Invoke-CdpCommand {
 
 function New-OverlayJavaScript {
     param(
-        # 初始媒体 dataURL（CSP 允许 data:，图片直接用）。
-        [Parameter(Mandatory)]
-        [string]$InitialDataURL,
+        # 初始媒体 dataURL。分块架构下可为空（注入空壳，随后由 Send-MediaToPage 推送）。
+        [string]$InitialDataURL = "",
 
         [Parameter(Mandatory)]
         [ValidateSet("image", "video")]
@@ -542,8 +541,9 @@ function New-OverlayJavaScript {
         // 避免 await blob 转换期间旧调用把元素改回旧媒体。
         const myToken = ++installToken;
 
-        // 视频需先转 blob URL（atob 解码，绕开 CSP）；图片直接用 dataURL（更快）。
-        const useUrl = snapType === "video"
+        // 视频：dataURL 需先 atob→blob 绕开 CSP；但若已是 blob: URL（分块 finalize 产物）则直接用。
+        const isBlob = snapUrl.startsWith("blob:");
+        const useUrl = (snapType === "video" && !isBlob)
             ? await toObjectUrl(snapUrl)
             : snapUrl;
         if (!useUrl) return false;
@@ -557,6 +557,7 @@ function New-OverlayJavaScript {
             if (sameType) {
                 existing.src = useUrl;
                 existing.style.opacity = opacityFor(snapType);
+                if (snapType === "video") ensurePlaying(existing);
                 return true;
             }
             existing.remove();
@@ -564,7 +565,22 @@ function New-OverlayJavaScript {
         const el = createElement(snapType, useUrl);
         el.id = overlayId;
         root.appendChild(el);
+        if (snapType === "video") ensurePlaying(el);
         return true;
+    }
+
+    // video 动态设置 src 后 autoplay 不一定触发，显式 play() 并监听 canplay/loadeddata。
+    // 必须（重）设 muted=true：某些情况下换 src 会重置 muted，导致 autoplay 策略拒绝播放。
+    function ensurePlaying(videoEl) {
+        try { videoEl.muted = true; videoEl.defaultMuted = true; } catch (e) {}
+        const tryPlay = () => {
+            try { videoEl.muted = true; } catch (e) {}
+            const p = videoEl.play();
+            if (p && p.catch) p.catch(() => {});
+        };
+        videoEl.addEventListener("loadeddata", tryPlay, { once: true });
+        videoEl.addEventListener("canplay", tryPlay, { once: true });
+        tryPlay();
     }
 
     // 供 PowerShell 端通过 CDP Runtime.evaluate 调用，实现轮换。
@@ -575,7 +591,44 @@ function New-OverlayJavaScript {
             current.type = type;
             installOverlay();
         },
-        version: "1.0"
+        version: "1.1"
+    };
+
+    // ============================================================
+    // 分块传输支持：大文件拆成多块 base64 经多次 CDP 推送，避免单次 payload 过大卡死。
+    // 流程：beginChunkedMedia(id,mime,type) → appendChunk(id,b64)* → finalizeChunkedMedia(id)
+    // finalize 时拼接所有块 → atob 解码 → Blob → setMedia。
+    // ============================================================
+    const chunkBuffers = {};  // id → { mime, type, parts: [b64...] }
+
+    window.__codexBgRotator.beginChunkedMedia = function(id, mime, type) {
+        chunkBuffers[id] = { mime: mime, type: type, parts: [] };
+    };
+    window.__codexBgRotator.appendChunk = function(id, b64Chunk) {
+        const buf = chunkBuffers[id];
+        if (buf) buf.parts.push(b64Chunk);
+    };
+    window.__codexBgRotator.finalizeChunkedMedia = function(id) {
+        return new Promise((resolve) => {
+            const buf = chunkBuffers[id];
+            if (!buf) { resolve(false); return; }
+            delete chunkBuffers[id];
+            try {
+                const fullB64 = buf.parts.join('');
+                const bin = atob(fullB64);
+                const len = bin.length;
+                const u8 = new Uint8Array(len);
+                for (let i = 0; i < len; i++) u8[i] = bin.charCodeAt(i);
+                const blobUrl = URL.createObjectURL(new Blob([u8], { type: buf.mime }));
+                // 直接走 setMedia 用 blob URL（图片视频通用，跳过 toObjectUrl 重复转换）。
+                current.url = blobUrl;
+                current.type = buf.type;
+                installOverlay();
+                resolve(true);
+            } catch (e) {
+                resolve(false);
+            }
+        });
     };
 
     $suppressBlock
@@ -659,33 +712,70 @@ function Install-CodexBackground {
 }
 
 function Send-MediaToPage {
-    # 通过 CDP 向页面推送新媒体（轮换用）。调用 window.__codexBgRotator.setMedia。
+    # 通过 CDP 向页面推送新媒体（分块传输，支持大文件）。
+    # 小文件（< 阈值）走一次性 setMedia；大文件走分块 begin/append*/finalize。
     param(
         [Parameter(Mandatory)]
         [string]$WebSocketUrl,
 
         [Parameter(Mandatory)]
-        [string]$DataURL,
+        [string]$Path,
 
         [Parameter(Mandatory)]
         [ValidateSet("image", "video")]
-        [string]$MediaType
+        [string]$MediaType,
+
+        # 分块阈值（字节）。文件小于此值走一次性传输；大于则分块。
+        [long]$ChunkThreshold = 3MB,
+
+        # 每块 base64 字符数（原始字节约 75%）。512K 字符 ≈ 384KB 原始，CDP 安全。
+        [int]$ChunkSize = 524288
     )
 
-    # 把 dataURL 安全地嵌入 JS 表达式（JSON 编码处理引号/特殊字符）。
-    $urlLit = ConvertTo-Json -InputObject $DataURL -Compress
-    $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
-    $expr = "window.__codexBgRotator && window.__codexBgRotator.setMedia($urlLit, $typeLit); true"
+    $mime = Get-MediaMimeType -Path $Path
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $base64 = [Convert]::ToBase64String($bytes)
+    $rotator = "window.__codexBgRotator"
 
-    Invoke-CdpCommand `
-        -WebSocketUrl $WebSocketUrl `
-        -Method "Runtime.evaluate" `
-        -Parameters @{
-        expression    = $expr
-        returnByValue = $true
-        awaitPromise  = $true
-    } `
+    if ($bytes.Length -lt $ChunkThreshold) {
+        # 小文件：一次性 setMedia（dataURL）。
+        $dataUrl = "data:$mime;base64,$base64"
+        $urlLit = ConvertTo-Json -InputObject $dataUrl -Compress
+        $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
+        $expr = "$rotator && $rotator.setMedia($urlLit, $typeLit); true"
+        Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+            -Parameters @{ expression = $expr; returnByValue = $true } -CommandId 1 | Out-Null
+        return
+    }
+
+    # 大文件：分块传输。
+    $mediaId = "m" + (Get-Date -Format "HHmmssfff") + (Get-Random -Maximum 10000)
+    $mimeLit = ConvertTo-Json -InputObject $mime -Compress
+    $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
+    $idLit = ConvertTo-Json -InputObject $mediaId -Compress
+
+    # begin
+    Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+        -Parameters @{ expression = "$rotator && $rotator.beginChunkedMedia($idLit, $mimeLit, $typeLit); true"; returnByValue = $true } `
         -CommandId 1 | Out-Null
+
+    # append 逐块
+    $totalChunks = [Math]::Ceiling($base64.Length / [double]$ChunkSize)
+    $cmdId = 2
+    for ($off = 0; $off -lt $base64.Length; $off += $ChunkSize) {
+        $end = [Math]::Min($off + $ChunkSize, $base64.Length)
+        $chunk = $base64.Substring($off, $end - $off)
+        $chunkLit = ConvertTo-Json -InputObject $chunk -Compress
+        Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+            -Parameters @{ expression = "$rotator && $rotator.appendChunk($idLit, $chunkLit); true"; returnByValue = $true } `
+            -CommandId $cmdId | Out-Null
+        $cmdId++
+    }
+
+    # finalize（awaitPromise 等 atob 完成）
+    Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+        -Parameters @{ expression = "$rotator && $rotator.finalizeChunkedMedia($idLit)"; returnByValue = $true; awaitPromise = $true } `
+        -CommandId $cmdId | Out-Null
 }
 
 function Resolve-MediaForCurrentRun {
@@ -822,23 +912,22 @@ try {
     $mainTarget = $targets[0]
     $mainWsUrl = [string]$mainTarget.webSocketDebuggerUrl
 
-    # 4. 把初始媒体转 dataURL。
-    Write-Host "正在编码初始媒体：$resolvedMediaPath"
-    $initial = ConvertTo-MediaDataURL -Path $resolvedMediaPath
-    Write-Host ("已编码：{0} （{1}，{2} 字节 → dataURL {3} 字符）" -f $initial.FileName, $initial.Type, $initial.Bytes, $initial.DataUrl.Length)
-
-    # 5. 构造并注入 overlay JS。
+    # 4. 构造并注入 overlay JS（空壳，不含媒体数据，避免大文件嵌入 JS 卡死）。
     $effectiveImageOpacity = if ($ImageOpacity -gt 0) { $ImageOpacity } else { $Opacity }
     $effectiveVideoOpacity = if ($VideoOpacity -gt 0) { $VideoOpacity } else { $Opacity }
 
     $javaScript = New-OverlayJavaScript `
-        -InitialDataURL $initial.DataUrl `
+        -InitialDataURL "" `
         -MediaType $mediaType `
         -ImageOpacityValue $effectiveImageOpacity `
         -VideoOpacityValue $effectiveVideoOpacity `
         -SuppressCodexPlus:$SuppressCodexPlus
 
     $installedCount = Install-CodexBackground -Targets $targets -JavaScript $javaScript
+
+    # 5. 注入完成后，用分块传输推送初始媒体（大文件自动分块，小文件走一次性 setMedia）。
+    Write-Host "正在推送初始媒体：$resolvedMediaPath"
+    Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $resolvedMediaPath -MediaType $mediaType
 
     # 仅 random/video 模式 + RotateInterval>0 才真正轮换。
     $effectiveRotate = if ($BackgroundMode -in @("random", "video") -and $RotateInterval -gt 0) { $RotateInterval } else { 0 }
@@ -876,23 +965,19 @@ try {
         Start-Sleep -Seconds $checkInterval
 
         # 检测 Codex 是否退出（CDP 端口消失即视为退出）。
-        $cdpOk = Test-CdpAvailable -Port $DebugPort -TimeoutSeconds 1
-        Write-Host ("[rotate-loop] 醒来，cdpOk={0}，距上次轮换 {1:F0}s" -f $cdpOk, ([DateTime]::UtcNow - $lastRotate).TotalSeconds)
-        if (-not $cdpOk) {
+        if (-not (Test-CdpAvailable -Port $DebugPort -TimeoutSeconds 1)) {
             Write-Host "Codex CDP 端口已不可用，退出。"
             break
         }
 
-        # 轮换：到点则随机选新媒体推送。
+        # 轮换：到点则随机选新媒体推送（分块传输，支持大文件）。
         $elapsed = ([DateTime]::UtcNow - $lastRotate).TotalSeconds
         if ($effectiveRotate -gt 0 -and $elapsed -ge $effectiveRotate) {
             try {
                 $nextPath = Pick-RandomMediaPath -Mode $BackgroundMode -MediaDirectory $mediaDirectory -FixedImagePath $ImagePath -FixedVideoPath $VideoPath
-                Write-Host ("[rotate] 选到媒体：{0}" -f $nextPath)
-                $next = ConvertTo-MediaDataURL -Path $nextPath
-                Write-Host ("[rotate] 编码完成：{0} 字符" -f $next.DataUrl.Length)
-                Send-MediaToPage -WebSocketUrl $mainWsUrl -DataURL $next.DataUrl -MediaType $next.Type
-                Write-Host ("轮换：{0} （{1}）" -f $next.FileName, $next.Type)
+                $nextType = Get-MediaType -Path $nextPath
+                Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $nextPath -MediaType $nextType
+                Write-Host ("轮换：{0} （{1}）" -f [IO.Path]::GetFileName($nextPath), $nextType)
             }
             catch {
                 Write-Warning "轮换失败（已跳过，不影响现有背景）：$($_.Exception.Message)"
