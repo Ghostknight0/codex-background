@@ -10,22 +10,24 @@
 
 ## 🚀 快速开始
 
-​```powershell
-# 0. 前置：已安装 Codex 桌面版（必需）
-#       如装了 Codex++（可选，推荐），请在 Codex++ 设置里关闭「背景图覆盖」（避免双层背景叠加）
+**前置**：已安装 Codex 桌面版（必需）。如装了 Codex++（可选，推荐），请在 Codex++ 设置里关闭「背景图覆盖」（避免双层背景叠加）。
 
-# 1. 克隆或下载本仓库到固定位置（不要解压后又移动）
-cd D:\zbg\codex-background   # 或你放置的目录
+**三步搞定**：
 
-# 2. 用 PowerShell 7 一行安装（自动探测 Codex++，用包内示例素材）
-pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1
+1. 克隆或下载本仓库到固定位置（不要解压后又移动）
+2. 用 PowerShell 7 安装（自动探测环境，用包内示例素材）：
 
-# 3. 双击桌面的「Codex Background」快捷方式启动
-​```
+   ```powershell
+   pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1
+   ```
 
-就这三步。工具会自动找到 Codex++，用 Codex++ 启动 Codex（开启 CDP 调试端口），再用 `assets\` 里的示例图片视频做 `random` 模式混合随机，每 60 分钟换一个。
+3. 双击桌面的「Codex Background」快捷方式启动
+
+工具会自动选择最优启动方式（有 Codex++ 走 Codex++，没有则直接激活 Codex），用 `assets\` 里的示例图片视频做 `random` 模式混合随机，每 60 分钟换一个。
 
 > ⚠️ 如果 Codex 已经在跑且 CDP 端口 9229 已开，则直接注入（不重启 Codex），不打断会话。
+
+> 💡 想用自己的壁纸库？安装时加 `-MediaDirectory "E:\你的壁纸库"`，图片视频可混放。
 
 ---
 
@@ -107,12 +109,11 @@ pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 `
 关于背景图：**Codex++ 自带一个静态背景图功能**（id `codex-plus-image-overlay`）。为避免与本工具的轮换层叠加显示（双层半透明图会很乱），请：
 
 - **推荐**：在 Codex++ 设置里关闭「背景图覆盖」。本工具默认不开启压制，保持 JS 精简。
-- **保险**：万一 Codex++ 升级或配置被重置导致背景图「诈尸」，安装时加 `-SuppressCodexPlus`，工具会用 `MutationObserver` 持续清除 Codex++ 的背景层。
+- **保险**：万一 Codex++ 升级或配置被重置导致背景图「诈尸」，安装时加 `-SuppressCodexPlus`，工具会用 `MutationObserver` 持续清除 Codex++ 的背景层：
 
-​```powershell
-# 安装时一并开启 Codex++ 背景压制（保险）
-pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 -SuppressCodexPlus
-​```
+  ```powershell
+  pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 -SuppressCodexPlus
+  ```
 
 ---
 
