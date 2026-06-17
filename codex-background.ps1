@@ -163,16 +163,24 @@ function Test-CdpAvailable {
         [Parameter(Mandatory)]
         [int]$Port,
 
-        [int]$TimeoutSeconds = 2
+        [int]$TimeoutSeconds = 2,
+
+        # 连续失败多少次才判定端口不可用（容忍短暂抖动/大文件传输期间的响应变慢）。
+        [int]$RequiredFailures = 3
     )
 
-    try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds
-        return $true
+    # 单次探测。
+    $tries = if ($RequiredFailures -gt 1) { $RequiredFailures } else { 1 }
+    for ($i = 1; $i -le $tries; $i++) {
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds
+            return $true  # 一次成功即可
+        }
+        catch {
+            if ($i -lt $tries) { Start-Sleep -Milliseconds 500 }
+        }
     }
-    catch {
-        return $false
-    }
+    return $false
 }
 
 function Find-CodexPlusLauncher {
@@ -1083,27 +1091,32 @@ try {
     $lastRotate = [DateTime]::UtcNow
 
     while ($true) {
-        Start-Sleep -Seconds $checkInterval
+        # 整个循环体包一层 try/catch：任何意外异常（stdin 中断、CDP 抖动、媒体读取失败等）
+        # 都只记日志继续循环，绝不让进程退出。只有 CDP 连续探测失败才 break。
+        try {
+            # Start-Sleep 包 try/catch：非 -NonInteractive 启动时 stdin 异常可能中断 sleep。
+            try { Start-Sleep -Seconds $checkInterval } catch { Start-Sleep -Milliseconds 500 }
 
-        # 检测 Codex 是否退出（CDP 端口消失即视为退出）。
-        if (-not (Test-CdpAvailable -Port $DebugPort -TimeoutSeconds 1)) {
-            Write-Host "Codex CDP 端口已不可用，退出。"
-            break
-        }
+            # 检测 Codex 是否退出：连续 3 次探测失败才算退出（容忍大文件传输期间 9229 响应变慢）。
+            if (-not (Test-CdpAvailable -Port $DebugPort -TimeoutSeconds 2 -RequiredFailures 3)) {
+                Write-Host "Codex CDP 端口已不可用（连续探测失败），退出。"
+                break
+            }
 
-        # 轮换：到点则随机选新媒体推送（分块传输，支持大文件）。
-        $elapsed = ([DateTime]::UtcNow - $lastRotate).TotalSeconds
-        if ($effectiveRotate -gt 0 -and $elapsed -ge $effectiveRotate) {
-            try {
+            # 轮换：到点则随机选新媒体推送（分块传输，支持大文件）。
+            $elapsed = ([DateTime]::UtcNow - $lastRotate).TotalSeconds
+            if ($effectiveRotate -gt 0 -and $elapsed -ge $effectiveRotate) {
                 $nextPath = Pick-RandomMediaPath -Mode $BackgroundMode -MediaDirectory $mediaDirectory -FixedImagePath $ImagePath -FixedVideoPath $VideoPath
                 $nextType = Get-MediaType -Path $nextPath
                 Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $nextPath -MediaType $nextType
                 Write-Host ("轮换：{0} （{1}）" -f [IO.Path]::GetFileName($nextPath), $nextType)
+                $lastRotate = [DateTime]::UtcNow
             }
-            catch {
-                Write-Warning "轮换失败（已跳过，不影响现有背景）：$($_.Exception.Message)"
-            }
-            $lastRotate = [DateTime]::UtcNow
+        }
+        catch {
+            # 任何意外异常都只记日志，不退出进程（保证背景服务常驻）。
+            Write-Warning "轮换循环异常（已忽略，继续运行）：$($_.Exception.Message)"
+            Start-Sleep -Seconds 2
         }
     }
 
