@@ -206,6 +206,27 @@ function Test-CdpAvailable {
     return $false
 }
 
+function Find-CodexCdpPort {
+    # 从正在运行的 Codex.exe 进程命令行解析 --remote-debugging-port=NNNN。
+    # 新版 Codex++ 不再固定用 9229，而是动态端口（如 10373），必须实时探测。
+    # 返回端口数字；找不到返回 $null。
+    try {
+        $procs = Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -eq 'Codex.exe' -and $_.CommandLine -match 'remote-debugging-port=(\d+)'
+        }
+        foreach ($p in $procs) {
+            if ($p.CommandLine -match 'remote-debugging-port=(\d+)') {
+                $port = [int]$Matches[1]
+                # 确认该端口确实在监听（避免解析到子进程的无效端口）。
+                if (Test-CdpAvailable -Port $port -TimeoutSeconds 1 -RequiredFailures 1) {
+                    return $port
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
 function Find-CodexPlusLauncher {
     # 自动探测本机 Codex++ 主程序（codex-plus-plus.exe）路径。
     $commonCandidates = @(
@@ -1039,7 +1060,17 @@ try {
         $hasCodexPlus = [bool]$resolvedLauncherPath
     }
 
-    # 2. 检测 CDP 端口 + 启动（三分支）。
+    # 2. 动态探测 CDP 端口 + 启动（三分支）。
+    # 新版 Codex++ 不再固定 9229，而是动态端口（如 10373）。用户未显式指定 DebugPort 时，
+    # 优先从运行中的 Codex.exe 进程命令行解析实际端口。
+    if (-not $PSBoundParameters.ContainsKey('DebugPort')) {
+        $detectedPort = Find-CodexCdpPort
+        if ($detectedPort -and $detectedPort -ne $DebugPort) {
+            Write-Host "探测到 Codex 实际 CDP 端口：$detectedPort（非默认 $($DebugPort)）"
+            $DebugPort = $detectedPort
+        }
+    }
+
     $cdpReady = Test-CdpAvailable -Port $DebugPort
     if ($cdpReady) {
         Write-Host "检测到 Codex CDP 端口 $DebugPort 已在监听，直接注入（不重启 Codex）。"
@@ -1048,8 +1079,12 @@ try {
         throw "CDP 端口 $DebugPort 未在监听，且指定了 -NoLaunch 不启动 Codex。请先打开 Codex 后再运行。"
     }
     elseif ($hasCodexPlus) {
-        # 有 Codex++：走 Codex++ launcher（获得增强功能）。
+        # 有 Codex++：走 Codex++ launcher（获得增强功能）。Codex++ 会自己选端口，
+        # 启动后重新探测实际端口。
         Start-CodexViaLauncher -LauncherPath $resolvedLauncherPath | Out-Null
+        Start-Sleep -Seconds 3
+        $detectedPort = Find-CodexCdpPort
+        if ($detectedPort) { $DebugPort = $detectedPort }
     }
     else {
         # 无 Codex++：直接激活 Codex MSIX 并附加 CDP 端口（重启 Codex，无增强功能）。
