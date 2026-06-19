@@ -226,18 +226,29 @@ try {
     $resolvedPowerShellPath = (Resolve-Path -LiteralPath $PowerShellPath).Path
     $resolvedCSharpCompilerPath = (Resolve-Path -LiteralPath $CSharpCompilerPath).Path
     $resolvedNativeLauncherPath = [IO.Path]::GetFullPath($NativeLauncherPath)
-    $opacityLiteral = $Opacity.ToString(
-        "0.################",
-        [Globalization.CultureInfo]::InvariantCulture
-    )
-    # 构造双透明度参数片段：仅当指定了 ImageOpacity/VideoOpacity（>0）时才加入，避免无谓传参。
-    $opacityArgs = "-Opacity `"$opacityLiteral`""
-    if ($ImageOpacity -gt 0) {
-        $opacityArgs += " -ImageOpacity $ImageOpacity"
+
+    # ============================================================
+    # 生成 config.json：把用户配置写入项目目录，快捷方式就不再需要携带参数。
+    # （解决 .lnk 属性保存时参数被截断的问题）
+    # config 只含用户配置类参数，不含机器相关路径（Codex++ 由核心脚本运行时探测）。
+    # ============================================================
+    # image 模式 resolvedMediaPath 有值；random/video 模式为空，config 的 ImagePath 用入参原值。
+    $configImagePath = if ($resolvedMediaPath) { $resolvedMediaPath } else { $ImagePath }
+    $config = [ordered]@{
+        BackgroundMode = $BackgroundMode
+        MediaDirectory = $resolvedMediaDirectory
+        ImagePath      = $configImagePath
+        VideoPath      = $VideoPath
+        RotateInterval = $RotateInterval
+        Opacity        = $Opacity
+        ImageOpacity   = $ImageOpacity
+        VideoOpacity   = $VideoOpacity
     }
-    if ($VideoOpacity -gt 0) {
-        $opacityArgs += " -VideoOpacity $VideoOpacity"
-    }
+    $configPath = Join-Path $PSScriptRoot "config.json"
+    $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
+    Write-Host "已生成配置文件：$configPath"
+    Write-Host "（改配置请编辑此文件，不要改快捷方式属性——会被 Windows 截断）"
+
     $nativeLauncherDirectory = Split-Path -Parent $resolvedNativeLauncherPath
     $shortcutDirectory = Split-Path -Parent $ShortcutPath
 
@@ -276,31 +287,10 @@ try {
         New-Item -ItemType Directory -Path $shortcutDirectory -Force | Out-Null
     }
 
-    # 按模式构造 Arguments：image 模式传 ImagePath，random/video 模式传 MediaDirectory。
-    $modeArgs = switch ($BackgroundMode) {
-        "image" {
-            "-BackgroundMode image -ImagePath `"$resolvedMediaPath`""
-        }
-        default {
-            "-BackgroundMode $BackgroundMode -MediaDirectory `"$resolvedMediaDirectory`""
-        }
-    }
-
-    # 构造快捷方式完整参数：launcher.exe pwsh ps1 [模式/媒体] [透明度] [轮换] [Codex++路径] [压制开关]
-    # Codex++ 路径仅在检测到 Codex++ 时写入；不写则核心脚本自动回退 MSIX 自激活。
-    $fullArgs = (
-        "`"$resolvedPowerShellPath`" " +
-        "`"$resolvedLauncherPath`" " +
-        "$modeArgs " +
-        "$opacityArgs " +
-        "-RotateInterval $RotateInterval"
-    )
-    if ($hasCodexPlus) {
-        $fullArgs += " -CodexPlusLauncherPath `"$resolvedCodexPlusPath`""
-    }
-    if ($SuppressCodexPlus) {
-        $fullArgs += " -SuppressCodexPlus"
-    }
+    # 快捷方式只指向 launcher.exe + pwsh + ps1，不传任何配置参数。
+    # 所有配置已写入 config.json，核心脚本启动时读取。
+    # 这样 Target+Args 极短（仅两个路径），手动改快捷方式属性→保存也不会截断。
+    $fullArgs = "`"$resolvedPowerShellPath`" `"$resolvedLauncherPath`""
 
     # 探测 Codex 图标，取不到则用 launcher 自身图标。
     $codexIcon = Find-CodexIcon

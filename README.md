@@ -68,6 +68,22 @@ pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 `
 
 图片视频可混放同一目录。支持格式：图片 `.jpg .jpeg .png .gif .webp .bmp`，视频 `.mp4 .webm .mov .mkv .avi`（推荐 `.mp4 H.264`，加载最快最兼容）。
 
+## 修改配置
+
+安装后所有配置保存在项目目录的 `config.json`。**想改背景/透明度/轮换间隔，编辑这个文件即可**，不用重新安装，也**不要手动改快捷方式属性**（Windows 保存时会截断参数）。
+
+```json
+{
+  "BackgroundMode": "random",
+  "MediaDirectory": "E:\\wallpapervideo",
+  "RotateInterval": 3600,
+  "Opacity": 0.15,
+  "VideoOpacity": 0.2
+}
+```
+
+改完保存，重启快捷方式生效。命令行参数优先级高于 config.json（临时覆盖用 `-MediaDirectory "..."` 等）。
+
 ---
 
 ## 参数说明

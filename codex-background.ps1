@@ -54,6 +54,29 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ============================================================
+# 读取 config.json：未显式传命令行参数时用 config 覆盖脚本默认值。
+# 优先级：命令行参数 > config.json > 脚本默认值。
+# 这样快捷方式无需携带参数（避免 .lnk 属性保存截断），配置由 config.json 提供。
+# ============================================================
+$configPath = Join-Path $PSScriptRoot "config.json"
+if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+    try {
+        $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        # 白名单：只认这些配置项，避免未知键污染变量。
+        $configKeys = @("BackgroundMode", "ImagePath", "MediaDirectory", "VideoPath", "RotateInterval", "Opacity", "ImageOpacity", "VideoOpacity")
+        foreach ($key in $configKeys) {
+            # 只在 config 有该键、且命令行未显式传该参数时，才用 config 值覆盖默认。
+            if ($config.ContainsKey($key) -and -not $PSBoundParameters.ContainsKey($key)) {
+                Set-Variable -Name $key -Value $config[$key] -Scope Script
+            }
+        }
+    }
+    catch {
+        Write-Warning "config.json 解析失败，已忽略（使用默认值）：$($_.Exception.Message)"
+    }
+}
+
 # 支持的媒体扩展名分类。
 $script:ImageExtensions = @(".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 $script:VideoExtensions = @(".mp4", ".webm", ".mov", ".mkv", ".avi")

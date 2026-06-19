@@ -8,6 +8,9 @@
 *.err.log
 test-*
 
+# 本机配置：install 脚本生成，含本机绝对路径（媒体目录、Codex++ 路径等），不进仓库。
+config.json
+
 # 备份
 *.bak
 
