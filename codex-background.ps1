@@ -192,12 +192,18 @@ function Test-CdpAvailable {
         [int]$RequiredFailures = 3
     )
 
-    # 单次探测。
+    # 单次探测：不只是 HTTP 通就行，还要验证返回的确实是 CDP（有 webSocketDebuggerUrl 字段）。
+    # 避免端口被别的程序占用时拿到非 CDP 响应却误判为可用。
     $tries = if ($RequiredFailures -gt 1) { $RequiredFailures } else { 1 }
     for ($i = 1; $i -le $tries; $i++) {
         try {
-            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds
-            return $true  # 一次成功即可
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds
+            # CDP /json/version 必含 webSocketDebuggerUrl；非 CDP 服务不会返回这个字段。
+            if ($resp -and $resp.webSocketDebuggerUrl) {
+                return $true
+            }
+            # HTTP 通但不是 CDP（端口被其他程序占用）——视为不可用，不重试。
+            return $false
         }
         catch {
             if ($i -lt $tries) { Start-Sleep -Milliseconds 500 }
@@ -1007,6 +1013,17 @@ function Pick-RandomMediaPath {
 # main
 # ============================================================
 try {
+    # 单实例保护：杀掉其他正在跑的 codex-background.ps1 进程，避免新旧实例抢注入。
+    # 快捷方式重复双击时，确保只有最新这一个实例在工作。
+    $myPid = $PID
+    Get-CimInstance Win32_Process | Where-Object {
+        $_.CommandLine -match 'codex-background\.ps1' -and $_.ProcessId -ne $myPid
+    } | ForEach-Object {
+        Write-Host ("关闭旧实例 PID $($_.ProcessId)...")
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 500
+
     # 解析本次运行的媒体。
     $media = Resolve-MediaForCurrentRun `
         -Mode $BackgroundMode `
