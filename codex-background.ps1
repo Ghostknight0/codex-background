@@ -1096,12 +1096,23 @@ try {
         throw "CDP 端口 $DebugPort 未在监听，且指定了 -NoLaunch 不启动 Codex。请先打开 Codex 后再运行。"
     }
     elseif ($hasCodexPlus) {
-        # 有 Codex++：走 Codex++ launcher（获得增强功能）。Codex++ 会自己选端口，
-        # 启动后重新探测实际端口。
+        # 有 Codex++：走 Codex++ launcher（获得增强功能）。Codex++ 会自己选端口。
         Start-CodexViaLauncher -LauncherPath $resolvedLauncherPath | Out-Null
-        Start-Sleep -Seconds 3
-        $detectedPort = Find-CodexCdpPort
-        if ($detectedPort) { $DebugPort = $detectedPort }
+        # Codex++ 启动 Codex 需要时间（尤其重启后要恢复会话），轮询等待 CDP 端口出现。
+        Write-Host "等待 Codex 启动并开启 CDP 端口..."
+        $waitDeadline = [DateTime]::UtcNow.AddSeconds(60)
+        while ([DateTime]::UtcNow -lt $waitDeadline) {
+            Start-Sleep -Seconds 2
+            $detectedPort = Find-CodexCdpPort
+            if ($detectedPort) {
+                $DebugPort = $detectedPort
+                Write-Host "Codex CDP 端口已就绪：$DebugPort"
+                break
+            }
+        }
+        if (-not $detectedPort) {
+            Write-Warning "等待 Codex CDP 端口超时（60秒），尝试用默认端口 $DebugPort 继续。"
+        }
     }
     else {
         # 无 Codex++：直接激活 Codex MSIX 并附加 CDP 端口（重启 Codex，无增强功能）。
@@ -1130,8 +1141,14 @@ try {
     $installedCount = Install-CodexBackground -Targets $targets -JavaScript $javaScript
 
     # 5. 注入完成后，用分块传输推送初始媒体（大文件自动分块，小文件走一次性 setMedia）。
+    # 用 try/catch 包裹：初始推送失败不退出进程（轮换循环会继续尝试推送新媒体）。
     Write-Host "正在推送初始媒体：$resolvedMediaPath"
-    Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $resolvedMediaPath -MediaType $mediaType
+    try {
+        Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $resolvedMediaPath -MediaType $mediaType
+    }
+    catch {
+        Write-Warning "初始媒体推送失败（不影响后续轮换，循环会重试）：$($_.Exception.Message)"
+    }
 
     # 仅 random/video 模式 + RotateInterval>0 才真正轮换。
     $effectiveRotate = if ($BackgroundMode -in @("random", "video") -and $RotateInterval -gt 0) { $RotateInterval } else { 0 }
