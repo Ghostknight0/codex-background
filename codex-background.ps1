@@ -695,6 +695,29 @@ function New-OverlayJavaScript {
         } catch (error) {}
     }
 
+    // 隐藏窗口被 Chromium 暂停后，重新可见或获得焦点时恢复当前活动视频。
+    function resumeActiveVideo() {
+        const video = activeElement || document.getElementById(overlayId);
+        if (!video || video.tagName.toLowerCase() !== "video") return;
+        try {
+            video.muted = true;
+            video.defaultMuted = true;
+            const playback = video.play();
+            if (playback && typeof playback.catch === "function") {
+                playback.catch(() => {});
+            }
+        } catch (error) {}
+    }
+
+    function onVisibilityChange() {
+        if (!document.hidden) {
+            resumeActiveVideo();
+        }
+    }
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", resumeActiveVideo);
+
     // 候选背景尚未展示时可直接销毁，当前活动背景始终保持不动。
     function discardCandidate() {
         const element = candidateElement;
@@ -793,6 +816,7 @@ function New-OverlayJavaScript {
         candidateElement = null;
         candidateBlobUrl = "";
         revokeBlobUrl(oldBlobUrl);
+        resumeActiveVideo();
         return true;
     }
 
@@ -848,6 +872,8 @@ function New-OverlayJavaScript {
         // 重复注入或页面卸载前统一回收候选、活动背景和所有未完成传输。
         dispose() {
             installToken++;
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+            window.removeEventListener("focus", resumeActiveVideo);
             Object.keys(chunkBuffers).forEach((id) => rotator.abortChunkedMedia(id));
             discardCandidate();
             const element = activeElement || document.getElementById(overlayId);

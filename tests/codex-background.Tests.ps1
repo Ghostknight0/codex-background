@@ -55,4 +55,12 @@ Describe "Background media streaming contracts" {
     It "clears src before removing both image and video backgrounds" {
         $overlaySource | Should Match '(?s)function removeMediaElement\(el\) \{.*?const tagName = el\.tagName\.toLowerCase\(\);.*?el\.removeAttribute\("src"\);.*?if \(tagName === "video"\) \{.*?el\.load\(\);'
     }
+
+    It "resumes the active video after the page becomes visible again" {
+        $overlaySource | Should Match 'function resumeActiveVideo'
+        $overlaySource | Should Match 'document\.addEventListener\("visibilitychange", onVisibilityChange\)'
+        $overlaySource | Should Match 'window\.addEventListener\("focus", resumeActiveVideo\)'
+        $overlaySource | Should Match 'document\.removeEventListener\("visibilitychange", onVisibilityChange\)'
+        $overlaySource | Should Match 'window\.removeEventListener\("focus", resumeActiveVideo\)'
+    }
 }
