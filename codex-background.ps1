@@ -213,12 +213,13 @@ function Test-CdpAvailable {
 }
 
 function Find-CodexCdpPort {
-    # 从正在运行的 Codex.exe 进程命令行解析 --remote-debugging-port=NNNN。
+    # 从正在运行的 Codex/ChatGPT 进程命令行解析 --remote-debugging-port=NNNN。
+    # CDP host 进程名随版本变化：旧版是 Codex.exe，新版 26.707+ 改名 ChatGPT.exe。
     # 新版 Codex++ 不再固定用 9229，而是动态端口（如 10373），必须实时探测。
     # 返回端口数字；找不到返回 $null。
     try {
         $procs = Get-CimInstance Win32_Process | Where-Object {
-            $_.Name -eq 'Codex.exe' -and $_.CommandLine -match 'remote-debugging-port=(\d+)'
+            $_.Name -in @('Codex.exe', 'ChatGPT.exe') -and $_.CommandLine -match 'remote-debugging-port=(\d+)'
         }
         foreach ($p in $procs) {
             if ($p.CommandLine -match 'remote-debugging-port=(\d+)') {
