@@ -160,27 +160,6 @@ function Get-RandomMediaFromDirectory {
     return ($videoPool | Get-Random)
 }
 
-function ConvertTo-MediaDataURL {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    # 把媒体文件读成 base64 dataURL。
-    # Codex 页面 CSP 禁止 http://127.0.0.1，但允许 data: 和 blob:，
-    # 因此所有媒体必须以 dataURL（图片直接用）或经页面转 blob URL（视频）的方式注入。
-    $mime = Get-MediaMimeType -Path $Path
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $base64 = [Convert]::ToBase64String($bytes)
-    return @{
-        DataUrl = "data:$mime;base64,$base64"
-        Type    = Get-MediaType -Path $Path
-        Bytes   = $bytes.Length
-        Mime    = $mime
-        FileName = [IO.Path]::GetFileName($Path)
-    }
-}
-
 function Test-CdpAvailable {
     param(
         [Parameter(Mandatory)]
@@ -584,13 +563,6 @@ function Invoke-CdpCommand {
 
 function New-OverlayJavaScript {
     param(
-        # 初始媒体 dataURL。分块架构下可为空（注入空壳，随后由 Send-MediaToPage 推送）。
-        [string]$InitialDataURL = "",
-
-        [Parameter(Mandatory)]
-        [ValidateSet("image", "video")]
-        [string]$MediaType,
-
         [Parameter(Mandatory)]
         [ValidateRange(0.01, 1.0)]
         [double]$ImageOpacityValue,
@@ -602,7 +574,6 @@ function New-OverlayJavaScript {
         [switch]$SuppressCodexPlus
     )
 
-    $sourceLiteral = ConvertTo-Json -InputObject $InitialDataURL -Compress
     $imageOpacityLiteral = $ImageOpacityValue.ToString(
         "0.################",
         [Globalization.CultureInfo]::InvariantCulture
@@ -611,7 +582,6 @@ function New-OverlayJavaScript {
         "0.################",
         [Globalization.CultureInfo]::InvariantCulture
     )
-    $typeLiteral = ConvertTo-Json -InputObject $MediaType -Compress
 
     # 压制 Codex++ 静态背景图（保险开关）。
     $suppressBlock = if ($SuppressCodexPlus) {
@@ -632,44 +602,49 @@ function New-OverlayJavaScript {
         ""
     }
 
-    # 架构说明（绕开 Codex CSP）：
-    #   Codex 页面 CSP 禁止 http://127.0.0.1，但允许 data: 和 blob:。
-    #   - 图片：直接用 dataURL 作为 src。
-    #   - 视频：dataURL 过大且 <video> 对 dataURL 支持不佳，先 fetch(dataURL)→blob→createObjectURL。
-    #   轮换由 PowerShell 端定时通过 CDP 调用 window.__codexBgRotator.setMedia(dataURL, type) 实现。
+    # Codex 仅允许 blob: 作为此注入场景的可靠媒体源。
+    # 所有媒体都由页面端分块解码后创建 Blob，避免 dataURL 的整文件字符串副本。
     return @"
 (() => {
     const overlayId = "codex-bg-rotator-overlay";
-    let current = { url: $sourceLiteral, type: $typeLiteral };
     const opacityByType = { image: "$imageOpacityLiteral", video: "$videoOpacityLiteral" };
-    // 视频用的 blob URL，换源时需 revoke 旧的，避免内存泄漏。
-    let currentBlobUrl = "";
-    // installToken：单调递增，保证只有最新的 installOverlay 调用能落盘 DOM。
+
+    // 新脚本覆盖旧注入时，优先让旧 rotator 回收自己的候选层和 Blob。
+    const previousRotator = window.__codexBgRotator;
+    if (previousRotator && typeof previousRotator.dispose === "function") {
+        try { previousRotator.dispose(); } catch (error) {}
+    }
+
+    // 兼容旧版本没有 dispose 的场景，避免遗留背景层继续引用旧 Blob。
+    const legacyOverlay = document.getElementById(overlayId);
+    if (legacyOverlay) {
+        const legacyUrl = legacyOverlay.src || "";
+        removeMediaElement(legacyOverlay);
+        if (legacyUrl.startsWith("blob:")) {
+            try { URL.revokeObjectURL(legacyUrl); } catch (error) {}
+        }
+    }
+
+    // activeBlobUrl 只指向已经展示的背景；候选资源单独跟踪，避免抢占时误释放当前背景。
+    let activeBlobUrl = "";
+    let activeElement = null;
+    let candidateBlobUrl = "";
+    let candidateElement = null;
     let installToken = 0;
+    const chunkBuffers = Object.create(null);
 
     function opacityFor(type) {
         return opacityByType[type] || opacityByType.image;
     }
 
-    // 把 dataURL 转成 blob URL（视频必需；图片直接用 dataURL 更快）。
-    // 注意：不能用 fetch(dataURL)——会被 Codex CSP 的 connect-src 拦截。
-    // 改用 atob 在 JS 层解码 base64，再构造 Blob，完全绕开网络层 CSP。
-    async function toObjectUrl(dataUrl) {
-        try {
-            const b64 = dataUrl.split(',')[1];
-            const bin = atob(b64);
-            const len = bin.length;
-            const u8 = new Uint8Array(len);
-            for (let i = 0; i < len; i++) u8[i] = bin.charCodeAt(i);
-            const mime = dataUrl.substring(5, dataUrl.indexOf(';'));
-            const blob = new Blob([u8], { type: mime });
-            return URL.createObjectURL(blob);
-        } catch (e) {
-            return "";
+    // 仅回收本 rotator 创建的 Blob URL，重复调用也不会影响页面其他资源。
+    function revokeBlobUrl(url) {
+        if (typeof url === "string" && url.startsWith("blob:")) {
+            try { URL.revokeObjectURL(url); } catch (error) {}
         }
     }
 
-    function createElement(type, url) {
+    function createElement(type) {
         let el;
         if (type === "video") {
             el = document.createElement("video");
@@ -700,120 +675,194 @@ function New-OverlayJavaScript {
         for (const k in commonStyle) {
             el.style[k] = commonStyle[k];
         }
-        el.src = url;
         return el;
     }
 
-    async function installOverlay() {
-        const root = document.documentElement;
-        if (!root) return false;
-
-        // 快照本次要安装的媒体，防止 await 期间 current 被 setMedia 改动导致串台。
-        const snapType = current.type;
-        const snapUrl = current.url;
-        // 单调递增的 install token：只有最新的 installOverlay 调用才能最终落盘 DOM，
-        // 避免 await blob 转换期间旧调用把元素改回旧媒体。
-        const myToken = ++installToken;
-
-        // 视频：dataURL 需先 atob→blob 绕开 CSP；但若已是 blob: URL（分块 finalize 产物）则直接用。
-        const isBlob = snapUrl.startsWith("blob:");
-        const useUrl = (snapType === "video" && !isBlob)
-            ? await toObjectUrl(snapUrl)
-            : snapUrl;
-        if (!useUrl) return false;
-
-        // await 期间若有更新的 setMedia 抢占，则放弃本次安装。
-        if (myToken !== installToken) return false;
-
-        let existing = document.getElementById(overlayId);
-        if (existing) {
-            const sameType = (existing.tagName.toLowerCase() === snapType);
-            if (sameType) {
-                existing.src = useUrl;
-                existing.style.opacity = opacityFor(snapType);
-                if (snapType === "video") ensurePlaying(existing);
-                return true;
+    // 停止并移除媒体元素，使浏览器可以立刻释放其对应的解码与网络资源。
+    function removeMediaElement(el) {
+        if (!el) return;
+        try {
+            const tagName = el.tagName.toLowerCase();
+            if (tagName === "video") {
+                el.pause();
             }
-            existing.remove();
+            // 图片和视频都先解除 src，再移除节点，避免旧资源继续被元素引用。
+            el.removeAttribute("src");
+            if (tagName === "video") {
+                el.load();
+            }
+            el.remove();
+        } catch (error) {}
+    }
+
+    // 候选背景尚未展示时可直接销毁，当前活动背景始终保持不动。
+    function discardCandidate() {
+        const element = candidateElement;
+        const url = candidateBlobUrl;
+        candidateElement = null;
+        candidateBlobUrl = "";
+        removeMediaElement(element);
+        revokeBlobUrl(url);
+    }
+
+    // CDP 传入的是单块 Base64；在本次调用内立即转换为二进制，避免字符串长期驻留。
+    function decodeBase64Chunk(base64Chunk) {
+        const binary = atob(base64Chunk);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) {
+            bytes[index] = binary.charCodeAt(index);
         }
-        const el = createElement(snapType, useUrl);
-        el.id = overlayId;
-        root.appendChild(el);
-        if (snapType === "video") ensurePlaying(el);
+        return bytes;
+    }
+
+    // 图片等待 load，视频等待获得可播放帧并且静音播放成功；超时或失败时保留旧背景。
+    function waitForCandidate(element, type, blobUrl) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (success) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                element.removeEventListener("load", onImageLoad);
+                element.removeEventListener("loadeddata", onVideoData);
+                element.removeEventListener("error", onError);
+                resolve(success);
+            };
+            const onImageLoad = () => finish(true);
+            const onVideoData = () => {
+                try {
+                    element.muted = true;
+                    element.defaultMuted = true;
+                    const playback = element.play();
+                    if (playback && typeof playback.then === "function") {
+                        playback.then(() => finish(true)).catch(() => finish(false));
+                    } else {
+                        finish(true);
+                    }
+                } catch (error) {
+                    finish(false);
+                }
+            };
+            const onError = () => finish(false);
+            const timeoutId = setTimeout(() => finish(false), 15000);
+
+            element.addEventListener("error", onError, { once: true });
+            if (type === "video") {
+                element.addEventListener("loadeddata", onVideoData, { once: true });
+            } else {
+                element.addEventListener("load", onImageLoad, { once: true });
+            }
+            element.src = blobUrl;
+        });
+    }
+
+    // 只有候选层准备就绪后才替换活动背景，避免轮换期间出现空白。
+    async function stageBlob(blobUrl, type) {
+        const root = document.documentElement;
+        if (!root) {
+            revokeBlobUrl(blobUrl);
+            return false;
+        }
+
+        const token = ++installToken;
+        discardCandidate();
+        const candidate = createElement(type);
+        candidate.style.opacity = "0";
+        candidateElement = candidate;
+        candidateBlobUrl = blobUrl;
+        root.appendChild(candidate);
+
+        const ready = await waitForCandidate(candidate, type, blobUrl);
+        if (token !== installToken || !ready) {
+            if (candidateElement === candidate) {
+                discardCandidate();
+            } else {
+                removeMediaElement(candidate);
+                revokeBlobUrl(blobUrl);
+            }
+            return false;
+        }
+
+        const oldElement = activeElement;
+        const oldBlobUrl = activeBlobUrl;
+        candidate.style.opacity = opacityFor(type);
+        removeMediaElement(oldElement);
+        candidate.id = overlayId;
+        activeElement = candidate;
+        activeBlobUrl = blobUrl;
+        candidateElement = null;
+        candidateBlobUrl = "";
+        revokeBlobUrl(oldBlobUrl);
         return true;
     }
 
-    // video 动态设置 src 后 autoplay 不一定触发，显式 play() 并监听 canplay/loadeddata。
-    // 必须（重）设 muted=true：某些情况下换 src 会重置 muted，导致 autoplay 策略拒绝播放。
-    function ensurePlaying(videoEl) {
-        try { videoEl.muted = true; videoEl.defaultMuted = true; } catch (e) {}
-        const tryPlay = () => {
-            try { videoEl.muted = true; } catch (e) {}
-            const p = videoEl.play();
-            if (p && p.catch) p.catch(() => {});
-        };
-        videoEl.addEventListener("loadeddata", tryPlay, { once: true });
-        videoEl.addEventListener("canplay", tryPlay, { once: true });
-        tryPlay();
-    }
-
-    // 供 PowerShell 端通过 CDP Runtime.evaluate 调用，实现轮换。
-    // 用法：window.__codexBgRotator.setMedia("data:...", "image"|"video")
-    window.__codexBgRotator = {
-        setMedia: (dataUrl, type) => {
-            current.url = dataUrl;
-            current.type = type;
-            installOverlay();
+    const rotator = {
+        // 创建一条媒体传输的二进制块缓冲；同 id 重入时先释放旧缓冲。
+        beginChunkedMedia(id, mime, type) {
+            if (!id || !mime || (type !== "image" && type !== "video")) return false;
+            rotator.abortChunkedMedia(id);
+            chunkBuffers[id] = { mime: mime, type: type, parts: [] };
+            return true;
         },
-        version: "1.1"
-    };
 
-    // ============================================================
-    // 分块传输支持：大文件拆成多块 base64 经多次 CDP 推送，避免单次 payload 过大卡死。
-    // 流程：beginChunkedMedia(id,mime,type) → appendChunk(id,b64)* → finalizeChunkedMedia(id)
-    // finalize 时拼接所有块 → atob 解码 → Blob → setMedia。
-    // ============================================================
-    const chunkBuffers = {};  // id → { mime, type, parts: [b64...] }
-
-    window.__codexBgRotator.beginChunkedMedia = function(id, mime, type) {
-        chunkBuffers[id] = { mime: mime, type: type, parts: [] };
-    };
-    window.__codexBgRotator.appendChunk = function(id, b64Chunk) {
-        const buf = chunkBuffers[id];
-        if (buf) buf.parts.push(b64Chunk);
-    };
-    window.__codexBgRotator.finalizeChunkedMedia = function(id) {
-        return new Promise((resolve) => {
-            const buf = chunkBuffers[id];
-            if (!buf) { resolve(false); return; }
-            delete chunkBuffers[id];
+        // 每块在本调用内解码，chunkBuffers 只持有原始字节而不持有完整 Base64 文本。
+        appendChunk(id, base64Chunk) {
+            const buffer = chunkBuffers[id];
+            if (!buffer) return false;
             try {
-                const fullB64 = buf.parts.join('');
-                const bin = atob(fullB64);
-                const len = bin.length;
-                const u8 = new Uint8Array(len);
-                for (let i = 0; i < len; i++) u8[i] = bin.charCodeAt(i);
-                const blobUrl = URL.createObjectURL(new Blob([u8], { type: buf.mime }));
-                // 直接走 setMedia 用 blob URL（图片视频通用，跳过 toObjectUrl 重复转换）。
-                current.url = blobUrl;
-                current.type = buf.type;
-                installOverlay();
-                resolve(true);
-            } catch (e) {
-                resolve(false);
+                buffer.parts.push(decodeBase64Chunk(base64Chunk));
+                return true;
+            } catch (error) {
+                rotator.abortChunkedMedia(id);
+                return false;
             }
-        });
+        },
+
+        // Blob 构造完成后立即清空分块数组，后续由候选层负责接管或回收 Blob URL。
+        async finalizeChunkedMedia(id) {
+            const buffer = chunkBuffers[id];
+            if (!buffer) return false;
+            delete chunkBuffers[id];
+            let blobUrl = "";
+            try {
+                const blob = new Blob(buffer.parts, { type: buffer.mime });
+                buffer.parts.length = 0;
+                blobUrl = URL.createObjectURL(blob);
+                return await stageBlob(blobUrl, buffer.type);
+            } catch (error) {
+                buffer.parts.length = 0;
+                revokeBlobUrl(blobUrl);
+                return false;
+            }
+        },
+
+        // PowerShell 传输中断时显式释放尚未 finalize 的原始字节块。
+        abortChunkedMedia(id) {
+            const buffer = chunkBuffers[id];
+            if (!buffer) return false;
+            buffer.parts.length = 0;
+            delete chunkBuffers[id];
+            return true;
+        },
+
+        // 重复注入或页面卸载前统一回收候选、活动背景和所有未完成传输。
+        dispose() {
+            installToken++;
+            Object.keys(chunkBuffers).forEach((id) => rotator.abortChunkedMedia(id));
+            discardCandidate();
+            const element = activeElement || document.getElementById(overlayId);
+            const url = activeBlobUrl || (element && element.src) || "";
+            activeElement = null;
+            activeBlobUrl = "";
+            removeMediaElement(element);
+            revokeBlobUrl(url);
+        },
+
+        version: "2.0"
     };
 
+    window.__codexBgRotator = rotator;
     $suppressBlock
-
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", installOverlay, { once: true });
-    }
-    installOverlay();
-    // 延迟保险注入只在启动阶段做，且要尊重 installToken（避免和轮换打架）。
-    setTimeout(() => { if (installToken <= 1) installOverlay(); }, 500);
-    setTimeout(() => { if (installToken <= 1) installOverlay(); }, 2000);
 
     return true;
 })();
@@ -886,8 +935,7 @@ function Install-CodexBackground {
 }
 
 function Send-MediaToPage {
-    # 通过 CDP 向页面推送新媒体（分块传输，支持大文件）。
-    # 小文件（< 阈值）走一次性 setMedia；大文件走分块 begin/append*/finalize。
+    # 通过 CDP 向页面流式推送新媒体；PowerShell 端始终只保留一个原始字节块。
     param(
         [Parameter(Mandatory)]
         [string]$WebSocketUrl,
@@ -899,57 +947,79 @@ function Send-MediaToPage {
         [ValidateSet("image", "video")]
         [string]$MediaType,
 
-        # 分块阈值（字节）。文件小于此值走一次性传输；大于则分块。
-        [long]$ChunkThreshold = 3MB,
-
-        # 每块 base64 字符数（原始字节约 75%）。512K 字符 ≈ 384KB 原始，CDP 安全。
-        [int]$ChunkSize = 524288
+        # 原始字节块为 384 KiB；可整除 3，常规块编码后恰好为 512 KiB Base64 文本。
+        [ValidateRange(3, 8388608)]
+        [int]$RawChunkSize = 393216
     )
 
-    $mime = Get-MediaMimeType -Path $Path
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $base64 = [Convert]::ToBase64String($bytes)
-    $rotator = "window.__codexBgRotator"
-
-    if ($bytes.Length -lt $ChunkThreshold) {
-        # 小文件：一次性 setMedia（dataURL）。
-        $dataUrl = "data:$mime;base64,$base64"
-        $urlLit = ConvertTo-Json -InputObject $dataUrl -Compress
-        $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
-        $expr = "$rotator && $rotator.setMedia($urlLit, $typeLit); true"
-        Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
-            -Parameters @{ expression = $expr; returnByValue = $true } -CommandId 1 | Out-Null
-        return
+    if (($RawChunkSize % 3) -ne 0) {
+        throw "RawChunkSize 必须是 3 的倍数，以避免中间 Base64 块产生填充字符。"
     }
 
-    # 大文件：分块传输。
+    $mime = Get-MediaMimeType -Path $Path
+    $rotator = "window.__codexBgRotator"
     $mediaId = "m" + (Get-Date -Format "HHmmssfff") + (Get-Random -Maximum 10000)
     $mimeLit = ConvertTo-Json -InputObject $mime -Compress
     $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
     $idLit = ConvertTo-Json -InputObject $mediaId -Compress
 
-    # begin
-    Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
-        -Parameters @{ expression = "$rotator && $rotator.beginChunkedMedia($idLit, $mimeLit, $typeLit); true"; returnByValue = $true } `
-        -CommandId 1 | Out-Null
+    # 失败后必须通知页面释放已解码的分块，不能等到下一次轮换覆盖。
+    $transferStarted = $false
+    $transferFinished = $false
+    $stream = $null
+    try {
+        $beginResult = Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+            -Parameters @{ expression = "$rotator && $rotator.beginChunkedMedia($idLit, $mimeLit, $typeLit) === true"; returnByValue = $true } `
+            -CommandId 1
+        if (-not $beginResult.result.value) {
+            throw "页面未接受媒体传输初始化。"
+        }
+        $transferStarted = $true
 
-    # append 逐块
-    $totalChunks = [Math]::Ceiling($base64.Length / [double]$ChunkSize)
-    $cmdId = 2
-    for ($off = 0; $off -lt $base64.Length; $off += $ChunkSize) {
-        $end = [Math]::Min($off + $ChunkSize, $base64.Length)
-        $chunk = $base64.Substring($off, $end - $off)
-        $chunkLit = ConvertTo-Json -InputObject $chunk -Compress
-        Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
-            -Parameters @{ expression = "$rotator && $rotator.appendChunk($idLit, $chunkLit); true"; returnByValue = $true } `
-            -CommandId $cmdId | Out-Null
-        $cmdId++
+        $stream = [IO.File]::OpenRead($Path)
+        if ($stream.Length -eq 0) {
+            throw "媒体文件为空：$Path"
+        }
+
+        $buffer = [byte[]]::new($RawChunkSize)
+        $commandId = 2
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            # 当前块完成 CDP 调用后即被下一轮覆盖，不会在 PowerShell 中累积为整文件字符串。
+            $base64Chunk = [Convert]::ToBase64String($buffer, 0, $readCount)
+            $chunkLit = ConvertTo-Json -InputObject $base64Chunk -Compress
+            $appendResult = Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+                -Parameters @{ expression = "$rotator && $rotator.appendChunk($idLit, $chunkLit) === true"; returnByValue = $true } `
+                -CommandId $commandId
+            if (-not $appendResult.result.value) {
+                throw "页面拒绝媒体分块 #$commandId。"
+            }
+            $commandId++
+        }
+
+        # awaitPromise 让 PowerShell 等到 Blob 创建与候选背景切换完成，失败才进入 abort 分支。
+        $finalizeResult = Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+            -Parameters @{ expression = "$rotator && $rotator.finalizeChunkedMedia($idLit)"; returnByValue = $true; awaitPromise = $true } `
+            -CommandId $commandId
+        if (-not $finalizeResult.result.value) {
+            throw "页面未能完成媒体 Blob 构造或背景切换。"
+        }
+        $transferFinished = $true
     }
-
-    # finalize（awaitPromise 等 atob 完成）
-    Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
-        -Parameters @{ expression = "$rotator && $rotator.finalizeChunkedMedia($idLit)"; returnByValue = $true; awaitPromise = $true } `
-        -CommandId $cmdId | Out-Null
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+        if ($transferStarted -and -not $transferFinished) {
+            try {
+                Invoke-CdpCommand -WebSocketUrl $WebSocketUrl -Method "Runtime.evaluate" `
+                    -Parameters @{ expression = "$rotator && $rotator.abortChunkedMedia($idLit) === true"; returnByValue = $true } `
+                    -CommandId 999999 | Out-Null
+            }
+            catch {
+                Write-Warning "媒体传输清理失败：$($_.Exception.Message)"
+            }
+        }
+    }
 }
 
 function Resolve-MediaForCurrentRun {
@@ -1014,16 +1084,19 @@ function Pick-RandomMediaPath {
 # main
 # ============================================================
 try {
-    # 单实例保护：杀掉其他正在跑的 codex-background.ps1 进程，避免新旧实例抢注入。
-    # 快捷方式重复双击时，确保只有最新这一个实例在工作。
-    $myPid = $PID
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.CommandLine -match 'codex-background\.ps1' -and $_.ProcessId -ne $myPid
-    } | ForEach-Object {
-        Write-Host ("关闭旧实例 PID $($_.ProcessId)...")
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    # ValidateOnly 只做参数和资源检查，绝不能干扰正在运行的背景实例。
+    if (-not $ValidateOnly) {
+        # 单实例保护：杀掉其他正在跑的 codex-background.ps1 进程，避免新旧实例抢注入。
+        # 快捷方式重复双击时，确保只有最新这一个实例在工作。
+        $myPid = $PID
+        Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -match 'codex-background\.ps1' -and $_.ProcessId -ne $myPid
+        } | ForEach-Object {
+            Write-Host ("关闭旧实例 PID $($_.ProcessId)...")
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Milliseconds 500
 
     # 解析本次运行的媒体。
     $media = Resolve-MediaForCurrentRun `
@@ -1128,20 +1201,18 @@ try {
     $mainTarget = $targets[0]
     $mainWsUrl = [string]$mainTarget.webSocketDebuggerUrl
 
-    # 4. 构造并注入 overlay JS（空壳，不含媒体数据，避免大文件嵌入 JS 卡死）。
+    # 4. 构造并注入仅包含流式 rotator 的空壳，媒体字节随后按块传输。
     $effectiveImageOpacity = if ($ImageOpacity -gt 0) { $ImageOpacity } else { $Opacity }
     $effectiveVideoOpacity = if ($VideoOpacity -gt 0) { $VideoOpacity } else { $Opacity }
 
     $javaScript = New-OverlayJavaScript `
-        -InitialDataURL "" `
-        -MediaType $mediaType `
         -ImageOpacityValue $effectiveImageOpacity `
         -VideoOpacityValue $effectiveVideoOpacity `
         -SuppressCodexPlus:$SuppressCodexPlus
 
     $installedCount = Install-CodexBackground -Targets $targets -JavaScript $javaScript
 
-    # 5. 注入完成后，用分块传输推送初始媒体（大文件自动分块，小文件走一次性 setMedia）。
+    # 5. 注入完成后，以统一流式分块路径推送初始媒体。
     # 用 try/catch 包裹：初始推送失败不退出进程（轮换循环会继续尝试推送新媒体）。
     Write-Host "正在推送初始媒体：$resolvedMediaPath"
     try {
@@ -1172,7 +1243,7 @@ try {
     if ($SuppressCodexPlus) {
         Write-Host "Codex++ 背景压制：开启"
     }
-    Write-Host "注入方式：dataURL/blob（绕开 Codex CSP，不依赖本地 HTTP 服务）"
+    Write-Host "注入方式：流式 Base64/blob（绕开 Codex CSP，不依赖本地 HTTP 服务）"
 
     # 6. 【生命周期绑定】阻塞主线程，期间做轮换推送，直到 Codex 退出。
     Write-Host ""

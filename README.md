@@ -40,14 +40,14 @@ Codex 桌面应用本身不开放背景配置，也不自带 CDP 调试端口。
    - 装了 Codex++ → 通过 `codex-plus-plus.exe` 启动 Codex（Codex++ 附加 `--remote-debugging-port=9229` + 注入增强功能）。
    - 没装 Codex++ → 直接用 COM `IApplicationActivationManager` 激活 Codex MSIX 并附加 `--remote-debugging-port=9229`（**会重启 Codex，中断当前会话**，但无需任何第三方工具）。
 2. **注入**：工具连上 `http://127.0.0.1:9229`，通过 CDP 向 Codex 主窗口页面注入一段 JS，创建一个全屏 `<img>`/`<video>` 覆盖层作为背景。
-3. **媒体传输**（绕开 CSP 的关键）：Codex 页面有严格的 Content-Security-Policy（禁止 `http://127.0.0.1`，也禁止 `fetch(data:)`），但允许 `data:` 和 `blob:` 作为媒体源。因此：
-   - **图片**：文件读成 base64 **dataURL**，直接作为 `<img src>`（CSP 放行 `data:`）。
-   - **视频**：base64 → 页面内 `atob` 解码成二进制 → `Blob` → `URL.createObjectURL` 生成 `blob:` URL → 作为 `<video src>`（CSP 放行 `blob:`）。全程不经网络层，绕开 `connect-src` 限制。
-   - **大文件分块**：文件超过 3MB 时，base64 切成 512KB 的块，经多次 CDP 推送到页面缓冲区拼接（`begin/append*/finalize`），避免单次 WebSocket payload 过大卡死通道。这样几十 MB 甚至上百 MB 的视频也能流畅传输。
-4. **轮换**：PowerShell 端定时随机选新媒体，转 base64 后通过 CDP 推送（小文件一次性、大文件分块），调用页面里的 `window.__codexBgRotator` 更换背景。
+3. **媒体传输**（绕开 CSP 的关键）：Codex 页面有严格的 Content-Security-Policy，且实际运行时会拒绝 `file:` 与本地 HTTP 媒体 URL；但允许 `blob:` 作为媒体源。因此所有图片和视频都走同一条流式路径：
+   - **PowerShell**：用 `FileStream` 每次读取 384 KiB 原始字节，编码为一个 512 KiB Base64 块后立即通过 CDP 推送；不会把整份媒体文件读入或编码为完整字符串。
+   - **页面端**：每收到一块就立即 `atob` 解码为 `Uint8Array`，只保留原始字节块；全部到齐后创建 `Blob` 和 `blob:` URL，作为 `<img>` 或 `<video>` 的媒体源。
+   - **资源回收**：新媒体先作为透明候选层加载。图片加载成功、或视频拿到可播放帧并完成静音播放后才替换旧背景；旧元素会停止、清空 `src`、移除，并调用 `URL.revokeObjectURL`。传输、解码或加载失败时，旧背景继续显示。
+4. **轮换**：PowerShell 端定时随机选新媒体，以流式分块方式通过 CDP 调用页面里的 `window.__codexBgRotator` 更换背景；中断的传输会显式释放未完成分块。
 5. **生命周期**：工具进程常驻，等 Codex 退出后自动结束，不留孤儿进程。
 
-> 💡 视频较大时，分块传输 + atob 解码 + 视频初始化需要数秒到十几秒（取决于文件大小），期间背景可能短暂空白，属正常现象。
+> 💡 视频较大时，分块传输与视频初始化需要数秒到十几秒（取决于文件大小）；旧背景会保持到新视频就绪，避免轮换期间空白。
 
 ---
 
@@ -110,7 +110,7 @@ pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 `
 | `-VideoPath` | 无 | image 模式下直接放单个视频 |
 | `-NoLaunch` | 关 | 不启动 Codex++/Codex，只连已在跑的 9229 注入 |
 | `-CodexAumid` | 自动探测 | Codex MSIX 的 AUMID（无 Codex++ 时用于自激活）；默认用 Get-AppxPackage 自动取 |
-| `-ValidateOnly` | 关 | 只校验参数和资源，不连接/启动 Codex |
+| `-ValidateOnly` | 关 | 只校验参数和资源，不连接/启动 Codex，也不干扰正在运行的背景实例 |
 
 **透明度参考**：图片默认 `0.15`（温和），视频默认 `0.2`（动态内容更明显）。混合轮换时两者自动按类型切换。
 
@@ -141,7 +141,7 @@ pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 `
 | 报「等待 Codex CDP 页面超时」 | 确认 Codex 桌面版已装；手动打开 Codex 后，用 `-NoLaunch` 重试 |
 | 背景没出现 | `pwsh -File .\codex-background.ps1 -ValidateOnly` 验证参数；在 Codex 里 `Ctrl+Shift+I` 看 Console |
 | 出现双层背景图 | 在 Codex++ 设置里关闭背景图覆盖；或安装时加 `-SuppressCodexPlus` |
-| 视频背景几秒后才出现 | 正常现象：大视频分块传输 + atob 解码 + 初始化需要数秒（几十 MB 的视频约十秒） |
+| 视频背景几秒后才出现 | 正常现象：大视频需流式传输和初始化；旧背景会保留到新视频可播放 |
 | 视频空白不播放 | 多半格式问题（mkv/avi），转成 mp4 H.264；4K/超大视频加载更久，耐心等待 |
 | 卸载 | 删快捷方式 + 删仓库目录，Codex 与 Codex++ 不受影响 |
 
@@ -149,14 +149,14 @@ pwsh -ExecutionPolicy Bypass -File .\install-codex-background-shortcut.ps1 `
 
 ## 技术细节（给开发者）
 
-- **核心脚本** `codex-background.ps1`：CDP 注入 + 分块传输 + 轮换逻辑
-  - `New-OverlayJavaScript`：生成注入 JS（覆盖层 id `codex-bg-rotator-overlay`、图片 dataURL / 视频 atob→blob、双透明度、轮换 `setMedia` 接口、分块 `begin/append/finalize` 接口、`installToken` 防串台、`ensurePlaying` 强制播放、可选 Codex++ 压制）
-  - `Send-MediaToPage`：文件 → base64 → 小文件一次性 `setMedia` / 大文件（>3MB）分块 `begin/append*/finalize`
+- **核心脚本** `codex-background.ps1`：CDP 注入 + 流式传输 + 轮换逻辑
+  - `New-OverlayJavaScript`：生成注入 JS（覆盖层 id `codex-bg-rotator-overlay`、统一 `blob:` 媒体源、双透明度、候选层原子换源、`begin/append/finalize/abort/dispose` 分块接口、旧 Blob 回收、可选 Codex++ 压制）
+  - `Send-MediaToPage`：`FileStream` 按 384 KiB 原始块读取，逐块 Base64 编码并调用 `begin/append*/finalize`；失败时调用 `abort` 回收页面端缓冲
   - `Get-RandomMediaFromDirectory`：1:1 比例抽取（先抛硬币选类型再选文件）
   - `Find-CodexPlusLauncher` / `Start-CodexViaLauncher`：方案 C 启动链路
   - `Test-CdpAvailable`：探测 9229，已开则直接注入不重启
 - **启动器** `codex-background-launcher.cs`：~113 行 C#，无控制台拉起 pwsh，改源码后安装脚本自动重编译
-- **安全**：CDP 只绑 `127.0.0.1`；不修改 Codex/Codex++ 任何文件；不依赖本地 HTTP 服务（媒体全部以 dataURL/blob 方式注入，绕开 CSP）
+- **安全**：CDP 只绑 `127.0.0.1`；不修改 Codex/Codex++ 任何文件；不依赖本地 HTTP 服务（媒体最终以 `blob:` 注入，绕开 CSP）
 
 ---
 
