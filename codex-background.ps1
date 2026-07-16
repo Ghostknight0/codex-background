@@ -1282,15 +1282,48 @@ try {
 
     while ($true) {
         # 整个循环体包一层 try/catch：任何意外异常（stdin 中断、CDP 抖动、媒体读取失败等）
-        # 都只记日志继续循环，绝不让进程退出。只有 CDP 连续探测失败才 break。
+        # 都只记日志继续循环，绝不因异常退出。CDP 断开时进入限时重连（不是立即退出）。
         try {
             # Start-Sleep 包 try/catch：非 -NonInteractive 启动时 stdin 异常可能中断 sleep。
             try { Start-Sleep -Seconds $checkInterval } catch { Start-Sleep -Milliseconds 500 }
 
-            # 检测 Codex 是否退出：连续 3 次探测失败才算退出（容忍大文件传输期间 9229 响应变慢）。
+            # 检测 Codex 是否退出：连续 3 次探测失败才算断开（容忍大文件传输期间响应变慢）。
             if (-not (Test-CdpAvailable -Port $DebugPort -TimeoutSeconds 2 -RequiredFailures 3)) {
-                Write-Host "Codex CDP 端口已不可用（连续探测失败），退出。"
-                break
+                # CDP 断开 → 进入限时重连（Codex 可能在更新/重启，等它恢复）。
+                Write-Host "Codex CDP 端口断开，等待 Codex 恢复（最多 10 分钟）..."
+                $reconnectDeadline = [DateTime]::UtcNow.AddMinutes(10)
+                $reconnected = $false
+                while ([DateTime]::UtcNow -lt $reconnectDeadline) {
+                    Start-Sleep -Seconds 30
+                    try {
+                        # 重新探测端口（Codex 重开后端口可能变了）。
+                        $newPort = Find-CodexCdpPort
+                        if ($newPort) {
+                            $DebugPort = $newPort
+                            Write-Host "探测到 Codex 恢复，端口 $DebugPort，重新注入..."
+                            # 重新等 page target（Codex 页面是全新的，旧注入全没了）。
+                            $targets = @(Wait-CdpTargets -Port $DebugPort -TimeoutSeconds 60)
+                            $mainTarget = $targets[0]
+                            $mainWsUrl = [string]$mainTarget.webSocketDebuggerUrl
+                            # 重新注入 overlay JS。
+                            $null = Install-CodexBackground -Targets $targets -JavaScript $javaScript
+                            # 推送初始媒体。
+                            try { Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $resolvedMediaPath -MediaType $mediaType } catch {}
+                            $reconnected = $true
+                            $lastRotate = [DateTime]::UtcNow
+                            Write-Host "Codex 已恢复，背景重新注入完成。"
+                            break
+                        }
+                    }
+                    catch {
+                        # 重连过程中出错（target 还没就绪等），继续等下一轮探测。
+                        Write-Warning "重连尝试失败（继续等待）：$($_.Exception.Message)"
+                    }
+                }
+                if (-not $reconnected) {
+                    Write-Host "等待 Codex 恢复超时（10 分钟），退出。"
+                    break
+                }
             }
 
             # 轮换：到点则随机选新媒体推送（分块传输，支持大文件）。
