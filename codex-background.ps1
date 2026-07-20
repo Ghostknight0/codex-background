@@ -196,20 +196,31 @@ function Find-CodexCdpPort {
     # CDP host 进程名随版本变化：旧版是 Codex.exe，新版 26.707+ 改名 ChatGPT.exe。
     # 新版 Codex++ 不再固定用 9229，而是动态端口（如 10373），必须实时探测。
     # 返回端口数字；找不到返回 $null。
+    # ⚠️ 绝对不能返回 9230——那是 ZCode 的 CDP 端口，连上会把背景注入到 ZCode！
     try {
-        $procs = Get-CimInstance Win32_Process | Where-Object {
+        $procs = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
             $_.Name -in @('Codex.exe', 'ChatGPT.exe') -and $_.CommandLine -match 'remote-debugging-port=(\d+)'
         }
         foreach ($p in $procs) {
             if ($p.CommandLine -match 'remote-debugging-port=(\d+)') {
                 $port = [int]$Matches[1]
+                if ($port -eq 9230) { continue }  # 排除 ZCode 端口
                 # 确认该端口确实在监听（避免解析到子进程的无效端口）。
                 if (Test-CdpAvailable -Port $port -TimeoutSeconds 1 -RequiredFailures 1) {
                     return $port
                 }
             }
         }
-    } catch {}
+    } catch {
+        # Get-CimInstance 失败（如系统页面文件不足）→ 兜底：扫描常见 CDP 端口。
+        # 注意：不包含 9230（ZCode 专用，连上会误注入 ZCode 页面）。
+        Write-Warning "进程命令行查询失败，尝试扫描常见 CDP 端口..."
+        foreach ($candidatePort in @(9229, 3713, 2604, 6363, 10373)) {
+            if (Test-CdpAvailable -Port $candidatePort -TimeoutSeconds 1 -RequiredFailures 1) {
+                return $candidatePort
+            }
+        }
+    }
     return $null
 }
 
@@ -1114,12 +1125,17 @@ try {
     if (-not $ValidateOnly) {
         # 单实例保护：杀掉其他正在跑的 codex-background.ps1 进程，避免新旧实例抢注入。
         # 快捷方式重复双击时，确保只有最新这一个实例在工作。
+        # 注意：Get-CimInstance 在系统页面文件不足时会失败，这里容错（失败只跳过，不崩溃）。
         $myPid = $PID
-        Get-CimInstance Win32_Process | Where-Object {
-            $_.CommandLine -match 'codex-background\.ps1' -and $_.ProcessId -ne $myPid
-        } | ForEach-Object {
-            Write-Host ("关闭旧实例 PID $($_.ProcessId)...")
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        try {
+            Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+                $_.CommandLine -match 'codex-background\.ps1' -and $_.ProcessId -ne $myPid
+            } | ForEach-Object {
+                Write-Host ("关闭旧实例 PID $($_.ProcessId)...")
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Write-Warning "单实例保护跳过（Get-CimInstance 失败：$($_.Exception.Message)）"
         }
         Start-Sleep -Milliseconds 500
     }
