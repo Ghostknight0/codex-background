@@ -626,6 +626,12 @@ function New-OverlayJavaScript {
         try { previousRotator.dispose(); } catch (error) {}
     }
 
+    // 清理改名前（codex-bg-rotator-overlay）的残留元素，避免多层背景叠加。
+    const legacyOldName = document.getElementById("codex-bg-rotator-overlay");
+    if (legacyOldName) {
+        try { legacyOldName.remove(); } catch (error) {}
+    }
+
     // 兼容旧版本没有 dispose 的场景，避免遗留背景层继续引用旧 Blob。
     const legacyOverlay = document.getElementById(overlayId);
     if (legacyOverlay) {
