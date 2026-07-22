@@ -626,11 +626,25 @@ function New-OverlayJavaScript {
         try { previousRotator.dispose(); } catch (error) {}
     }
 
-    // 清理改名前（codex-bg-rotator-overlay）的残留元素，避免多层背景叠加。
-    const legacyOldName = document.getElementById("codex-bg-rotator-overlay");
-    if (legacyOldName) {
-        try { legacyOldName.remove(); } catch (error) {}
+    // 持续清理改名前（codex-bg-rotator-overlay）的残留元素。
+    // 旧版注册的 addScriptToEvaluateOnNewDocument 会在每次页面加载时重建旧 overlay，
+    // 单次清理不够，必须用 MutationObserver 持续清除，否则多层背景叠加。
+    const LEGACY_OVERLAY_ID = "codex-bg-rotator-overlay";
+    function removeLegacyOverlay() {
+        const el = document.getElementById(LEGACY_OVERLAY_ID);
+        if (el) {
+            try {
+                if (el.tagName === "VIDEO") { el.pause(); }
+                el.removeAttribute("src");
+                el.remove();
+            } catch (error) {}
+        }
     }
+    removeLegacyOverlay();
+    try {
+        new MutationObserver(removeLegacyOverlay)
+            .observe(document.documentElement, { childList: true, subtree: true });
+    } catch (error) {}
 
     // 兼容旧版本没有 dispose 的场景，避免遗留背景层继续引用旧 Blob。
     const legacyOverlay = document.getElementById(overlayId);
