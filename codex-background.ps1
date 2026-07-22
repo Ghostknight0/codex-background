@@ -617,11 +617,11 @@ function New-OverlayJavaScript {
     # 所有媒体都由页面端分块解码后创建 Blob，避免 dataURL 的整文件字符串副本。
     return @"
 (() => {
-    const overlayId = "codex-bg-rotator-overlay";
+    const overlayId = "cz-bg-rotator-overlay";
     const opacityByType = { image: "$imageOpacityLiteral", video: "$videoOpacityLiteral" };
 
     // 新脚本覆盖旧注入时，优先让旧 rotator 回收自己的候选层和 Blob。
-    const previousRotator = window.__codexBgRotator;
+    const previousRotator = window.__czBgRotator;
     if (previousRotator && typeof previousRotator.dispose === "function") {
         try { previousRotator.dispose(); } catch (error) {}
     }
@@ -898,7 +898,7 @@ function New-OverlayJavaScript {
         version: "2.0"
     };
 
-    window.__codexBgRotator = rotator;
+    window.__czBgRotator = rotator;
     $suppressBlock
 
     return true;
@@ -994,7 +994,7 @@ function Send-MediaToPage {
     }
 
     $mime = Get-MediaMimeType -Path $Path
-    $rotator = "window.__codexBgRotator"
+    $rotator = "window.__czBgRotator"
     $mediaId = "m" + (Get-Date -Format "HHmmssfff") + (Get-Random -Maximum 10000)
     $mimeLit = ConvertTo-Json -InputObject $mime -Compress
     $typeLit = ConvertTo-Json -InputObject $MediaType -Compress
