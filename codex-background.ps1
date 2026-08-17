@@ -900,6 +900,21 @@ function New-OverlayJavaScript {
             return true;
         },
 
+        // 小文件一次性推送接口：dataURL 直接转 Blob 展示（PowerShell 端 Send-MediaToPage 对 <3MB 文件走这里）。
+        // 注意：不能用 fetch(dataUrl)——会被 Codex CSP 的 connect-src 拦截，必须用 atob 解码。
+        async setMedia(dataUrl, type) {
+            if (!dataUrl || (type !== "image" && type !== "video")) return false;
+            try {
+                const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+                const mime = dataUrl.slice(5, dataUrl.indexOf(";"));
+                const bytes = decodeBase64Chunk(base64);
+                const blobUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+                return await stageBlob(blobUrl, type);
+            } catch (error) {
+                return false;
+            }
+        },
+
         // 重复注入或页面卸载前统一回收候选、活动背景和所有未完成传输。
         dispose() {
             installToken++;
@@ -1276,12 +1291,15 @@ try {
 
     # 5. 注入完成后，以统一流式分块路径推送初始媒体。
     # 用 try/catch 包裹：初始推送失败不退出进程（轮换循环会继续尝试推送新媒体）。
+    # 失败时置 $initialPushFailed，轮换循环初始化会让第一次重试在 60 秒内发生（而非等完整轮换周期）。
+    $initialPushFailed = $false
     Write-Host "正在推送初始媒体：$resolvedMediaPath"
     try {
         Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $resolvedMediaPath -MediaType $mediaType
     }
     catch {
-        Write-Warning "初始媒体推送失败（不影响后续轮换，循环会重试）：$($_.Exception.Message)"
+        $initialPushFailed = $true
+        Write-Warning "初始媒体推送失败（不影响后续轮换，60 秒后自动重试）：$($_.Exception.Message)"
     }
 
     # 仅 random/video 模式 + RotateInterval>0 才真正轮换。
@@ -1314,7 +1332,12 @@ try {
     # 轮换循环 + Codex 退出检测合并：每隔 min(rotate, 5) 秒检查一次。
     # 这样既能及时轮换，又能较快感知 Codex 退出。
     $checkInterval = if ($effectiveRotate -gt 0) { [Math]::Min($effectiveRotate, 5) } else { 5 }
-    $lastRotate = [DateTime]::UtcNow
+    # 初始推送失败时回退 lastRotate，让第一次轮换重试在 60 秒内发生（而非等完整周期）。
+    $lastRotate = if ($initialPushFailed) {
+        [DateTime]::UtcNow.AddSeconds(60 - $effectiveRotate)
+    } else {
+        [DateTime]::UtcNow
+    }
 
     while ($true) {
         # 整个循环体包一层 try/catch：任何意外异常（stdin 中断、CDP 抖动、媒体读取失败等）
