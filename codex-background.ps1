@@ -305,6 +305,7 @@ function Start-CodexViaLauncher {
 
 # 启动进程管理单独存放，避免继续扩大主脚本。
 . (Join-Path $PSScriptRoot 'codex-process.ps1')
+. (Join-Path $PSScriptRoot 'codex-window.ps1')
 
 function Get-CodexAumid {
     param(
@@ -1256,6 +1257,12 @@ try {
     # 取第一个（主窗口）用于轮换推送。
     $mainTarget = $targets[0]
     $mainWsUrl = [string]$mainTarget.webSocketDebuggerUrl
+
+    # 调试端口就绪不代表窗口已经显示；补发一次普通应用打开请求。
+    # 仅响应用户启动快捷方式，NoLaunch 和后续自动轮换不抢占窗口。
+    if (-not $NoLaunch) {
+        Show-CodexWindow -Aumid $CodexAumid
+    }
 
     # 4. 构造并注入仅包含流式 rotator 的空壳，媒体字节随后按块传输。
     $effectiveImageOpacity = if ($ImageOpacity -gt 0) { $ImageOpacity } else { $Opacity }
