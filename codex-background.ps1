@@ -65,7 +65,7 @@ if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try {
         $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
         # 白名单：只认这些配置项，避免未知键污染变量。
-        $configKeys = @("BackgroundMode", "ImagePath", "MediaDirectory", "VideoPath", "RotateInterval", "Opacity", "ImageOpacity", "VideoOpacity")
+        $configKeys = @("BackgroundMode", "ImagePath", "MediaDirectory", "VideoPath", "RotateInterval", "Opacity", "ImageOpacity", "VideoOpacity", "CodexPlusLauncherPath", "SuppressCodexPlus")
         foreach ($key in $configKeys) {
             # 只在 config 有该键、且命令行未显式传该参数时，才用 config 值覆盖默认。
             if ($config.ContainsKey($key) -and -not $PSBoundParameters.ContainsKey($key)) {
@@ -177,7 +177,7 @@ function Test-CdpAvailable {
     $tries = if ($RequiredFailures -gt 1) { $RequiredFailures } else { 1 }
     for ($i = 1; $i -le $tries; $i++) {
         try {
-            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -Method Get -TimeoutSec $TimeoutSeconds -NoProxy
             # CDP /json/version 必含 webSocketDebuggerUrl；非 CDP 服务不会返回这个字段。
             if ($resp -and $resp.webSocketDebuggerUrl) {
                 return $true
@@ -293,19 +293,13 @@ function Find-CodexPlusLauncher {
     return $null
 }
 
-function Start-CodexViaLauncher {
-    param(
-        [Parameter(Mandatory)]
-        [string]$LauncherPath
-    )
-
-    Write-Host "正在通过 Codex++ 启动 Codex：$LauncherPath"
-    return Start-Process -FilePath $LauncherPath
-}
+# Codex++ 启动兼容单独维护，避免继续扩大主脚本。
+. (Join-Path $PSScriptRoot 'codex-plus-launch.ps1')
 
 # 启动进程管理单独存放，避免继续扩大主脚本。
 . (Join-Path $PSScriptRoot 'codex-process.ps1')
 . (Join-Path $PSScriptRoot 'codex-window.ps1')
+. (Join-Path $PSScriptRoot 'codex-recovery.ps1')
 
 function Get-CodexAumid {
     param(
@@ -408,7 +402,7 @@ function Wait-CdpTargets {
 
     do {
         try {
-            $rawTargets = Invoke-RestMethod -Uri $endpoint -Method Get -TimeoutSec 2
+            $rawTargets = Invoke-RestMethod -Uri $endpoint -Method Get -TimeoutSec 2 -NoProxy
             if ($rawTargets -isnot [System.Array]) {
                 $rawTargets = @($rawTargets)
             }
@@ -466,8 +460,10 @@ function Invoke-CdpCommand {
         $connected = $false
         for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             $socket = [Net.WebSockets.ClientWebSocket]::new()
+            # 调试连接只访问本机，避免系统代理截获或延迟 WebSocket 握手。
+            $socket.Options.Proxy = $null
             try {
-                $socket.ConnectAsync([Uri]$WebSocketUrl, $cancellation.Token).GetAwaiter().GetResult()
+                [void]$socket.ConnectAsync([Uri]$WebSocketUrl, $cancellation.Token).GetAwaiter().GetResult()
                 $connected = $true
                 break
             }
@@ -494,7 +490,7 @@ function Invoke-CdpCommand {
 
         $payloadBytes = [Text.Encoding]::UTF8.GetBytes($payload)
         $payloadSegment = [ArraySegment[byte]]::new($payloadBytes)
-        $socket.SendAsync(
+        [void]$socket.SendAsync(
             $payloadSegment,
             [Net.WebSockets.WebSocketMessageType]::Text,
             $true,
@@ -537,7 +533,7 @@ function Invoke-CdpCommand {
         if ($socket) {
             if ($socket.State -eq [Net.WebSockets.WebSocketState]::Open) {
                 try {
-                    $socket.CloseAsync(
+                    [void]$socket.CloseAsync(
                         [Net.WebSockets.WebSocketCloseStatus]::NormalClosure,
                         "done",
                         [Threading.CancellationToken]::None
@@ -1153,6 +1149,8 @@ try {
             Write-Warning "单实例保护跳过（Get-CimInstance 失败：$($_.Exception.Message)）"
         }
         Start-Sleep -Milliseconds 500
+        # 快捷方式没有控制台，保留本次启动记录，避免失败时无任何提示线索。
+        Start-Transcript -LiteralPath (Join-Path $PSScriptRoot 'codex-background.log') -Force | Out-Null
     }
 
     # 解析本次运行的媒体。
@@ -1231,7 +1229,8 @@ try {
         Start-CodexViaLauncher -LauncherPath $resolvedLauncherPath | Out-Null
         # Codex++ 启动 Codex 需要时间（尤其重启后要恢复会话），轮询等待 CDP 端口出现。
         Write-Host "等待 Codex 启动并开启 CDP 端口..."
-        $waitDeadline = [DateTime]::UtcNow.AddSeconds(60)
+        $detectedPort = $null
+        $waitDeadline = [DateTime]::UtcNow.AddSeconds(120)
         while ([DateTime]::UtcNow -lt $waitDeadline) {
             Start-Sleep -Seconds 2
             $detectedPort = Find-CodexCdpPort
@@ -1242,7 +1241,7 @@ try {
             }
         }
         if (-not $detectedPort) {
-            Write-Warning "等待 Codex CDP 端口超时（60秒），尝试用默认端口 $DebugPort 继续。"
+            throw '等待 Codex++ 启动超时（120 秒），请查看 codex-background.log 和 Codex++ 的启动状态。'
         }
     }
     else {
@@ -1260,7 +1259,7 @@ try {
 
     # 调试端口就绪不代表窗口已经显示；补发一次普通应用打开请求。
     # 仅响应用户启动快捷方式，NoLaunch 和后续自动轮换不抢占窗口。
-    if (-not $NoLaunch) {
+    if (-not $NoLaunch -and (-not $hasCodexPlus -or $cdpReady)) {
         Show-CodexWindow -Aumid $CodexAumid
     }
 
@@ -1371,12 +1370,22 @@ try {
                 }
             }
 
+            # Codex++ 可能刷新页面但保留端口；重新确认页面并补回丢失的 Blob 媒体。
+            $currentTargets = @(Wait-CdpTargets -Port $DebugPort -TimeoutSeconds 2)
+            $mainWsUrl = [string]$currentTargets[0].webSocketDebuggerUrl
+            $restored = Restore-CodexBackground -WebSocketUrl $mainWsUrl -JavaScript $javaScript `
+                -MediaPath $resolvedMediaPath -MediaType $mediaType
+            if ($restored) { $lastRotate = [DateTime]::UtcNow }
+
             # 轮换：到点则随机选新媒体推送（分块传输，支持大文件）。
             $elapsed = ([DateTime]::UtcNow - $lastRotate).TotalSeconds
             if ($effectiveRotate -gt 0 -and $elapsed -ge $effectiveRotate) {
                 $nextPath = Pick-RandomMediaPath -Mode $BackgroundMode -MediaDirectory $mediaDirectory -FixedImagePath $ImagePath -FixedVideoPath $VideoPath
                 $nextType = Get-MediaType -Path $nextPath
                 Send-MediaToPage -WebSocketUrl $mainWsUrl -Path $nextPath -MediaType $nextType
+                # 后续刷新或重连恢复当前背景，不退回最初随机选中的文件。
+                $resolvedMediaPath = $nextPath
+                $mediaType = $nextType
                 Write-Host ("轮换：{0} （{1}）" -f [IO.Path]::GetFileName($nextPath), $nextType)
                 $lastRotate = [DateTime]::UtcNow
             }
@@ -1393,4 +1402,7 @@ try {
 catch {
     Write-Error $_.Exception.Message
     exit 1
+}
+finally {
+    if (-not $ValidateOnly) { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 }

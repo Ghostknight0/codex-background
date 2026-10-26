@@ -2,7 +2,7 @@
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $source = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'codex-background.ps1')
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
-foreach ($name in @('Test-CdpAvailable', 'Start-CodexViaMsix', 'Start-CodexViaLauncher', 'Wait-CdpTargets', 'Get-CodexAumid')) {
+foreach ($name in @('Test-CdpAvailable', 'Start-CodexViaMsix', 'Wait-CdpTargets', 'Get-CodexAumid', 'Find-CodexCdpPort')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
@@ -10,6 +10,7 @@ foreach ($name in @('Test-CdpAvailable', 'Start-CodexViaMsix', 'Start-CodexViaLa
 }
 
 . (Join-Path $projectRoot 'codex-window.ps1')
+. (Join-Path $projectRoot 'codex-plus-launch.ps1')
 
 Describe '通过 Windows 应用入口显示窗口' {
     BeforeEach {
@@ -70,6 +71,20 @@ Describe '启动后显示 Codex 窗口' {
     It 'NoLaunch 只注入背景，不唤起窗口' {
         $NoLaunch = $true
         . $startup
+        Assert-MockCalled Show-CodexWindow -Times 0 -Exactly -Scope It
+    }
+
+    It 'Codex++ 启动后使用实际端口，不再额外打开官方入口' {
+        $hasCodexPlus = $true
+        $resolvedLauncherPath = 'C:\Apps\Codex++\codex-plus-plus.exe'
+        Mock Test-CdpAvailable { $false }
+        Mock Start-CodexViaLauncher {}
+        Mock Find-CodexCdpPort { 10373 }
+        Mock Start-Sleep {}
+        . $startup
+        $DebugPort | Should Be 10373
+        Assert-MockCalled Start-CodexViaLauncher -Times 1 -Exactly -Scope It
+        Assert-MockCalled Start-CodexViaMsix -Times 0 -Exactly -Scope It
         Assert-MockCalled Show-CodexWindow -Times 0 -Exactly -Scope It
     }
 }

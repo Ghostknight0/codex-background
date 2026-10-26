@@ -1,3 +1,4 @@
+# 安装无控制台背景快捷方式，并保存媒体与 Codex++ 启动配置。
 [CmdletBinding()]
 param(
     # 中文文件名会被本机桌面策略删除，因此默认使用稳定的英文入口名。
@@ -230,7 +231,7 @@ try {
     # ============================================================
     # 生成 config.json：把用户配置写入项目目录，快捷方式就不再需要携带参数。
     # （解决 .lnk 属性保存时参数被截断的问题）
-    # config 只含用户配置类参数，不含机器相关路径（Codex++ 由核心脚本运行时探测）。
+    # 保存明确选择的 Codex++ 路径；留空时由核心脚本运行时探测。
     # ============================================================
     # image 模式 resolvedMediaPath 有值；random/video 模式为空，config 的 ImagePath 用入参原值。
     $configImagePath = if ($resolvedMediaPath) { $resolvedMediaPath } else { $ImagePath }
@@ -243,6 +244,8 @@ try {
         Opacity        = $Opacity
         ImageOpacity   = $ImageOpacity
         VideoOpacity   = $VideoOpacity
+        CodexPlusLauncherPath = $resolvedCodexPlusPath
+        SuppressCodexPlus = [bool]$SuppressCodexPlus
     }
     $configPath = Join-Path $PSScriptRoot "config.json"
     $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
