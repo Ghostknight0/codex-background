@@ -1,3 +1,4 @@
+# 为 Codex 注入图片或视频背景，并按配置定时轮换。
 [CmdletBinding()]
 param(
     # 背景模式：image（固定单图）/ random（目录混合随机）/ video（目录随机视频）。
@@ -302,30 +303,8 @@ function Start-CodexViaLauncher {
     return Start-Process -FilePath $LauncherPath
 }
 
-function Stop-CodexProcesses {
-    # 优雅关闭当前所有 Codex 主进程（自激活前需重启 Codex 以附加 CDP 端口）。
-    # 只杀名为 Codex 的进程，不动其他程序。
-    $processes = @(Get-Process -Name "Codex" -ErrorAction SilentlyContinue)
-    if ($processes.Count -eq 0) { return }
-
-    Write-Host "正在关闭 Codex（重启以开启调试端口）..."
-    foreach ($process in $processes) {
-        if ($process.MainWindowHandle -ne 0) {
-            [void]$process.CloseMainWindow()
-        }
-    }
-
-    $deadline = [DateTime]::UtcNow.AddSeconds(8)
-    do {
-        Start-Sleep -Milliseconds 250
-        $remaining = @(Get-Process -Name "Codex" -ErrorAction SilentlyContinue)
-    } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
-
-    if ($remaining.Count -gt 0) {
-        $remaining | Stop-Process -Force -ErrorAction SilentlyContinue
-        Wait-Process -Id $remaining.Id -Timeout 10 -ErrorAction SilentlyContinue
-    }
-}
+# 启动进程管理单独存放，避免继续扩大主脚本。
+. (Join-Path $PSScriptRoot 'codex-process.ps1')
 
 function Get-CodexAumid {
     param(
