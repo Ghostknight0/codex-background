@@ -423,7 +423,8 @@ function Wait-CdpTargets {
             }
 
             if ($injectableTargets.Count -gt 0) {
-                return ,$injectableTargets
+                # 逐个输出页面，让调用方的 @() 收集目标；包装整个 List 会拼接多个连接地址。
+                return $injectableTargets.ToArray()
             }
         }
         catch {
