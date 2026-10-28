@@ -39,7 +39,7 @@ function Start-CodexViaLauncher {
                 return
             }
             # 状态文件可能仍显示旧的 running；以桌面进程为准，交给现有管理器启动。
-            Start-CodexViaRunningManager -ManagerId $managers[0].Id
+            Start-CodexViaRunningManager -ManagerId $managers[0].Id -LauncherPath $LauncherPath
             return
         }
     }

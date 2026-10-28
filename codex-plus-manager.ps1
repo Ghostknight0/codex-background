@@ -20,55 +20,43 @@ function Find-CodexPlusButton {
         [Windows.Automation.ControlType]::Button)
     foreach ($button in $Root.FindAll([Windows.Automation.TreeScope]::Descendants, $condition)) {
         $name = $button.Current.Name
-        if (($name -in $Names -or ($NamePattern -and $name -match $NamePattern)) -and $button.Current.IsEnabled) { return $button }
+        if (($name -in $Names -or ($NamePattern -and $name -match $NamePattern)) -and
+            $button.Current.IsEnabled -and -not $button.Current.IsOffscreen) { return $button }
     }
     return $null
 }
 
-function Start-CodexViaRunningManager {
+function Get-CodexPlusManagerWindow {
     param([Parameter(Mandatory)][int]$ManagerId)
+    # 由管理器自己显示窗口后，再读取它的界面；不直接更改 Windows 窗口显示状态。
+    $conditions = [Windows.Automation.Condition[]]@(
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ManagerId),
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, 'Codex++')
+    )
+    $condition = [Windows.Automation.AndCondition]::new($conditions)
+    return [Windows.Automation.AutomationElement]::RootElement.FindFirst(
+        [Windows.Automation.TreeScope]::Children, $condition)
+}
+
+function Start-CodexViaRunningManager {
+    param(
+        [Parameter(Mandatory)][int]$ManagerId,
+        [Parameter(Mandatory)][string]$LauncherPath,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 15
+    )
+    # 已有桌面进程时立即退出，避免改变用户刚刚打开的管理器窗口。
+    if (Test-CodexDesktopRunning) { return }
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    if (-not ('CodexBackgroundManagerWindow' -as [type])) {
-        # MainWindowHandle 可能指向隐藏的事件窗口，按进程和窗口类定位真正的管理器。
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-// 查找 Codex++ 管理器窗口并保留其原有显示状态。
-public static class CodexBackgroundManagerWindow {
-    private delegate bool EnumCallback(IntPtr window, IntPtr data);
-    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumCallback callback, IntPtr data);
-    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int length);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
-    public static IntPtr Find(int processId) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((window, data) => {
-            uint owner;
-            GetWindowThreadProcessId(window, out owner);
-            var name = new StringBuilder(256);
-            GetClassName(window, name, name.Capacity);
-            if (owner == (uint)processId && name.ToString() == "Tauri Window") { found = window; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-}
-'@
-    }
-    $handle = [CodexBackgroundManagerWindow]::Find($ManagerId)
-    if ($handle -eq [IntPtr]::Zero) { throw '未找到 Codex++ 管理器窗口，请在管理器中手动启动 Codex。' }
-    $wasVisible = [CodexBackgroundManagerWindow]::IsWindowVisible($handle)
-    try {
-        # 隐藏的 WebView 不提供界面元素，临时显示但不抢焦点。
-        if (-not $wasVisible) { [void][CodexBackgroundManagerWindow]::ShowWindow($handle, 4) }
-        $root = [Windows.Automation.AutomationElement]::FromHandle($handle)
-        if (-not $root) { throw '无法读取 Codex++ 窗口。' }
-        $deadline = [DateTime]::UtcNow.AddSeconds(15)
-        $navigationDone = $false
-        while ([DateTime]::UtcNow -lt $deadline) {
+    # 再次运行原程序只会唤起现有单实例，由 Tauri 同时恢复主窗口和 WebView。
+    Start-Process -FilePath $LauncherPath -WorkingDirectory (Split-Path -Parent $LauncherPath) `
+        -WindowStyle Normal -ErrorAction Stop | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $navigationDone = $false
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-CodexDesktopRunning) { return }
+        $root = Get-CodexPlusManagerWindow -ManagerId $ManagerId
+        if ($root) {
             if (Test-CodexDesktopRunning) { return }
             $button = Find-CodexPlusButton -Root $root -Names @('启动 Codex', 'Start Codex')
             if ($button) {
@@ -87,11 +75,9 @@ public static class CodexBackgroundManagerWindow {
                     $navigationDone = $true
                 }
             }
-            Start-Sleep -Milliseconds 500
         }
-        throw '未找到可用的“启动 Codex”按钮，请在 Codex++ 管理器中手动启动。'
+        Start-Sleep -Milliseconds 500
     }
-    finally {
-        if (-not $wasVisible) { [void][CodexBackgroundManagerWindow]::ShowWindow($handle, 0) }
-    }
+    # 失败时保留已经显示的管理器，方便查看状态并手动操作。
+    throw '未找到可用的“启动 Codex”按钮，已保留 Codex++ 界面，请在管理器中手动启动。'
 }
