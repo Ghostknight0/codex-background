@@ -27,6 +27,8 @@ Describe 'Codex++ 新版启动适配' {
         Mock Wait-Process {}
         Mock Test-CdpAvailable { $false }
         Mock Stop-CodexProcesses {}
+        Mock Test-CodexDesktopRunning { $false }
+        Mock Start-CodexViaRunningManager {}
     }
     AfterEach { $env:CODEX_PLUS_STATE_DIR = $script:savedStateDir }
 
@@ -37,15 +39,16 @@ Describe 'Codex++ 新版启动适配' {
         Assert-MockCalled Stop-CodexProcesses -Times 1 -Exactly -Scope It
     }
 
-    It '只重启状态明确为 stopped 的同路径空闲管理器' {
+    It '管理器已运行但 Codex 已停止时，只请求管理器启动 Codex' {
         '{"status":"stopped"}' | Set-Content (Join-Path $script:stateRoot 'latest-status.json')
         Mock Get-Process { @(
             [pscustomobject]@{ Id = 101; Path = 'C:\Apps\Codex++\codex-plus-plus.exe' },
             [pscustomobject]@{ Id = 102; Path = 'C:\Other\codex-plus-plus.exe' }
         ) }
         Start-CodexViaLauncher -LauncherPath 'C:\Apps\Codex++\codex-plus-plus.exe'
-        Assert-MockCalled Stop-Process -Times 1 -Exactly -Scope It -ParameterFilter { $Id -eq 101 }
-        Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It
+        Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-CodexViaRunningManager -Times 1 -Exactly -Scope It -ParameterFilter { $ManagerId -eq 101 }
     }
 
     It '管理器正在启动时保留现有进程，不重复启动' {
@@ -56,12 +59,27 @@ Describe 'Codex++ 新版启动适配' {
         Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
     }
 
-    It '未知状态不强制关闭管理器' {
+    It '状态未知且 Codex 不在运行时，请求现有管理器启动' {
         Mock Get-Process { [pscustomobject]@{ Id = 101; Path = 'C:\Apps\Codex++\codex-plus-plus.exe' } }
-        $caught = $false
-        try { Start-CodexViaLauncher -LauncherPath 'C:\Apps\Codex++\codex-plus-plus.exe' }
-        catch { $caught = $true }
-        $caught | Should Be $true
+        Start-CodexViaLauncher -LauncherPath 'C:\Apps\Codex++\codex-plus-plus.exe'
+        Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-CodexViaRunningManager -Times 1 -Exactly -Scope It
+    }
+
+    It '状态仍显示 running 但 Codex 已退出时，请求现有管理器启动' {
+        '{"status":"running"}' | Set-Content (Join-Path $script:stateRoot 'latest-status.json')
+        Mock Get-Process { [pscustomobject]@{ Id = 101; Path = 'C:\Apps\Codex++\codex-plus-plus.exe' } }
+        Start-CodexViaLauncher -LauncherPath 'C:\Apps\Codex++\codex-plus-plus.exe'
+        Assert-MockCalled Start-CodexViaRunningManager -Times 1 -Exactly -Scope It
+        Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
+    }
+
+    It 'Codex 进程已经运行时，不重复请求启动或关闭管理器' {
+        '{"status":"running"}' | Set-Content (Join-Path $script:stateRoot 'latest-status.json')
+        Mock Get-Process { [pscustomobject]@{ Id = 101; Path = 'C:\Apps\Codex++\codex-plus-plus.exe' } }
+        Mock Test-CodexDesktopRunning { $true }
+        Start-CodexViaLauncher -LauncherPath 'C:\Apps\Codex++\codex-plus-plus.exe'
+        Assert-MockCalled Start-CodexViaRunningManager -Times 0 -Exactly -Scope It
         Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
     }
 

@@ -1,4 +1,5 @@
-# 通过 Codex++ 原生自动启动设置兼容统一管理器，保留旧版静默启动方式。
+# 通过 Codex++ 管理器启动 Codex，保留旧版静默启动方式。
+. (Join-Path $PSScriptRoot 'codex-plus-manager.ps1')
 function Start-CodexViaLauncher {
     param(
         [Parameter(Mandatory)]
@@ -23,25 +24,23 @@ function Start-CodexViaLauncher {
             $status = if (Test-Path -LiteralPath $statusPath) {
                 Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
             } else { $null }
-            if ($status.status -in @('starting', 'running', 'running_degraded') -or
+            if ($status.status -eq 'starting' -or
                 ($status.phase -and $status.progress -lt 100 -and $status.status -ne 'failed')) {
                 Write-Host 'Codex++ 已有启动或运行任务，保留管理器并等待调试端口。'
                 return
-            }
-            if ($status.status -notin @('stopped', 'failed')) {
-                throw 'Codex++ 已运行但未确认空闲，请在管理器中点击启动，或正常退出管理器后重新运行快捷方式。'
             }
             # 状态文件可能刚过期；端口仍可用时不关闭管理器，交给主脚本复用连接。
             if ($status.debug_port -and (Test-CdpAvailable -Port $status.debug_port -RequiredFailures 1)) {
                 Write-Host 'Codex++ 调试端口仍可用，保留现有管理器。'
                 return
             }
-            # 开关仅在进程初始化时读取；只有明确停止的同路径管理器才重新打开。
-            Write-Host 'Codex++ 当前会话已停止，重新打开空闲管理器以触发原生自动启动。'
-            foreach ($manager in $managers) {
-                Stop-Process -Id $manager.Id -Force -ErrorAction Stop
-                Wait-Process -Id $manager.Id -Timeout 10 -ErrorAction SilentlyContinue
+            if (Test-CodexDesktopRunning) {
+                Write-Host 'Codex 已运行，保留现有进程并等待调试端口。'
+                return
             }
+            # 状态文件可能仍显示旧的 running；以桌面进程为准，交给现有管理器启动。
+            Start-CodexViaRunningManager -ManagerId $managers[0].Id
+            return
         }
     }
 
