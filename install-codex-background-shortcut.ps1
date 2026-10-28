@@ -129,21 +129,29 @@ function Find-CodexPlusLauncher {
 }
 
 function Find-CodexIcon {
-    # 探测 Codex MSIX 安装目录下的 Codex.exe，用于快捷方式图标。
+    # 从安装清单读取主程序，避免新版无图标的 Codex.exe 兼容入口造成图标空白。
     try {
         $pkg = Get-AppxPackage -Name "OpenAI.Codex" -ErrorAction Stop | Select-Object -First 1
         if ($pkg -and $pkg.InstallLocation) {
-            $icon = Join-Path $pkg.InstallLocation "app\Codex.exe"
-            if (Test-Path -LiteralPath $icon -PathType Leaf) {
-                return $icon
+            $manifest = Get-AppxPackageManifest -Package $pkg -ErrorAction Stop
+            $application = $manifest.Package.Applications.Application |
+                Where-Object { $_.Id -eq 'App' } | Select-Object -First 1
+            if ($application.Executable) {
+                $icon = Join-Path $pkg.InstallLocation $application.Executable
+                if (Test-Path -LiteralPath $icon -PathType Leaf) {
+                    return $icon
+                }
             }
         }
     } catch {}
 
     # 兜底：常见 WindowsApps 路径（版本号会变，用通配扫描）。
-    $wildcard = Join-Path $env:ProgramFiles "WindowsApps\OpenAI.Codex_*\app\Codex.exe"
-    $found = Get-ChildItem -Path $wildcard -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($found) { return $found.FullName }
+    # 优先选择新版主程序，同时保留旧版安装的兼容路径。
+    foreach ($executable in @('ChatGPT.exe', 'Codex.exe')) {
+        $wildcard = Join-Path $env:ProgramFiles "WindowsApps\OpenAI.Codex_*\app\$executable"
+        $found = Get-ChildItem -Path $wildcard -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
 
     return $null
 }
