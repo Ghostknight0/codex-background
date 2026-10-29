@@ -11,6 +11,11 @@ internal static class CodexManagerWindowFixture
     private delegate bool WindowVisitor(IntPtr window, IntPtr data);
     private static WindowProcedure callback = HandleMessage;
     private static IntPtr button;
+    private static IntPtr receipt;
+    // 让启动请求保持待处理，用于检测脚本是否重复点击。
+    private static bool requestPending;
+    private static int requestCount;
+    private static bool navigationRequired;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct WindowClass
@@ -49,7 +54,14 @@ internal static class CodexManagerWindowFixture
     {
         // 第二次运行只显示原窗口，启动按钮只更新文字作为验证信号。
         if (message == 0x8001) { ShowWindow(window, 4); return IntPtr.Zero; }
-        if (message == 0x0111 && wParam.ToInt64() == 1) { SetWindowText(button, "已启动"); return IntPtr.Zero; }
+        if (message == 0x0111 && wParam.ToInt64() == 1) {
+            requestCount++;
+            SetWindowText(receipt, "请求次数：" + requestCount);
+            if (!requestPending) SetWindowText(button, "已启动");
+            return IntPtr.Zero;
+        }
+        // 导航开关只有 TogglePattern，切换之后才显示真正的启动按钮。
+        if (message == 0x0111 && wParam.ToInt64() == 2) { ShowWindow(button, 4); return IntPtr.Zero; }
         return DefWindowProc(window, message, wParam, lParam);
     }
 
@@ -66,7 +78,14 @@ internal static class CodexManagerWindowFixture
             IntPtr window = CreateWindowEx(0, cls.className, "Codex++", 0x00CF0000, 40, 40, 320, 160, IntPtr.Zero, IntPtr.Zero, cls.instance, IntPtr.Zero);
             if (window == IntPtr.Zero) return;
             string caption = args.Length > 0 && args[0] == "no-start" ? "重启 Codex" : "启动 Codex";
+            navigationRequired = args.Length > 0 && args[0] == "navigation";
+            requestPending = args.Length > 0 && args[0] == "request-pending";
             button = CreateWindowEx(0, "BUTTON", caption, 0x50010000, 20, 20, 180, 40, window, new IntPtr(1), IntPtr.Zero, IntPtr.Zero);
+            receipt = CreateWindowEx(0, "STATIC", "请求次数：0", 0x50000000, 20, 100, 180, 20, window, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (navigationRequired) {
+                ShowWindow(button, 0);
+                CreateWindowEx(0, "BUTTON", "Codex · 未运行", 0x50011003, 20, 70, 180, 30, window, new IntPtr(2), IntPtr.Zero, IntPtr.Zero);
+            }
             // 初始保持隐藏，模拟托盘中的 Codex++；由第二次原程序启动请求显示。
             Message message;
             while (GetMessage(out message, IntPtr.Zero, 0, 0)) { TranslateMessage(ref message); DispatchMessage(ref message); }

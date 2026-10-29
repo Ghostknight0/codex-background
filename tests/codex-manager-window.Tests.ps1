@@ -14,7 +14,14 @@ Describe '真实管理器窗口的启动操作' {
         if ($LASTEXITCODE -ne 0) { throw '测试窗口编译失败' }
         $script:fixture = Start-Process -FilePath $script:fixtureExe -WindowStyle Hidden -PassThru
         Start-Sleep -Milliseconds 500
-        Mock Test-CodexDesktopRunning { $false }
+        # 测试窗口用“已启动”标记模拟桌面进程出现，不启动真正的聊天应用。
+        Mock Test-CodexDesktopRunning {
+            $root = Get-CodexPlusManagerWindow -ManagerId $script:fixture.Id
+            if (-not $root) { return $false }
+            $condition = [Windows.Automation.PropertyCondition]::new(
+                [Windows.Automation.AutomationElement]::NameProperty, '已启动')
+            return $null -ne $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+        }
     }
     AfterEach {
         # 只结束本用例创建的测试进程，不操作真实管理器或聊天应用。
@@ -40,6 +47,46 @@ Describe '真实管理器窗口的启动操作' {
     }
 
     if (-not $ManagerSource) {
+        It '启动请求没有生效时，继续等待并报告失败，不重复点击' {
+            Stop-Process -Id $script:fixture.Id -Force
+            Wait-Process -Id $script:fixture.Id -Timeout 5 -ErrorAction SilentlyContinue
+            $script:fixture = Start-Process -FilePath $script:fixtureExe -ArgumentList 'request-pending' -WindowStyle Hidden -PassThru
+            Start-Sleep -Milliseconds 500
+            Mock Test-CodexDesktopRunning { $false }
+            $failure = $null
+            try { Start-CodexViaRunningManager -ManagerId $script:fixture.Id -LauncherPath $script:fixtureExe -TimeoutSeconds 2 }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match '仍未检测到桌面进程'
+            $root = Get-CodexPlusManagerWindow -ManagerId $script:fixture.Id
+            ($null -ne $root) | Should Be $true
+            $condition = [Windows.Automation.PropertyCondition]::new(
+                [Windows.Automation.AutomationElement]::NameProperty, '请求次数：1')
+            ($null -ne $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)) | Should Be $true
+        }
+
+        It '从其他页面通过 TogglePattern 导航后，一次操作就能启动' {
+            Stop-Process -Id $script:fixture.Id -Force
+            Wait-Process -Id $script:fixture.Id -Timeout 5 -ErrorAction SilentlyContinue
+            $script:fixture = Start-Process -FilePath $script:fixtureExe -ArgumentList 'navigation' -WindowStyle Hidden -PassThru
+            Start-Sleep -Milliseconds 500
+            # 原生测试控件的类型是 CheckBox，但模式与实际 WebView 导航按钮相同。
+            # 只调整元素查找，导航和启动均走真实窗口操作。
+            $script:realFindButton = ${function:Find-CodexPlusButton}
+            Mock Find-CodexPlusButton {
+                param($Root, $Names, $NamePattern)
+                if ($NamePattern) {
+                    $condition = [Windows.Automation.PropertyCondition]::new(
+                        [Windows.Automation.AutomationElement]::NameProperty, 'Codex · 未运行')
+                    return $Root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+                }
+                & $script:realFindButton -Root $Root -Names $Names
+            }
+            Start-CodexViaRunningManager -ManagerId $script:fixture.Id -LauncherPath $script:fixtureExe -TimeoutSeconds 3
+            $root = Get-CodexPlusManagerWindow -ManagerId $script:fixture.Id
+            $button = & $script:realFindButton -Root $root -Names @('已启动')
+            ($null -ne $button) | Should Be $true
+        }
+
         It '没有启动按钮时报告失败，管理器界面仍可操作' {
             Stop-Process -Id $script:fixture.Id -Force
             Wait-Process -Id $script:fixture.Id -Timeout 5 -ErrorAction SilentlyContinue

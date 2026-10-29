@@ -38,11 +38,38 @@ function Get-CodexPlusManagerWindow {
         [Windows.Automation.TreeScope]::Children, $condition)
 }
 
+function Invoke-CodexPlusControl {
+    param([Parameter(Mandatory)]$Element, [switch]$AllowToggle)
+    # 普通操作按钮提供 InvokePattern，Codex 模块入口则提供 TogglePattern。
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+        $pattern.Invoke()
+        return
+    }
+    if ($AllowToggle -and $Element.TryGetCurrentPattern([Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+        # 已选中的模块无需再次切换，否则会折叠左侧导航。
+        if ($pattern.Current.ToggleState -ne [Windows.Automation.ToggleState]::On) { $pattern.Toggle() }
+        return
+    }
+    throw "Codex++ 控件不支持所需操作：$($Element.Current.Name)"
+}
+
+function Show-CodexPlusOverview {
+    param([Parameter(Mandatory)]$Root)
+    # 先选择 Codex 模块，再进入概览；原先保留的供应商等子页面没有启动按钮。
+    $navigation = Find-CodexPlusButton -Root $Root -Names @('Codex') -NamePattern '^Codex\s*[·•]'
+    if ($navigation) { Invoke-CodexPlusControl -Element $navigation -AllowToggle }
+    $overview = Find-CodexPlusButton -Root $Root -Names @('概览', 'Overview')
+    if (-not $overview) { return $false }
+    Invoke-CodexPlusControl -Element $overview
+    return $true
+}
+
 function Start-CodexViaRunningManager {
     param(
         [Parameter(Mandatory)][int]$ManagerId,
         [Parameter(Mandatory)][string]$LauncherPath,
-        [ValidateRange(1, 60)][int]$TimeoutSeconds = 15
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 60
     )
     # 已有桌面进程时立即退出，避免改变用户刚刚打开的管理器窗口。
     if (Test-CodexDesktopRunning) { return }
@@ -53,31 +80,30 @@ function Start-CodexViaRunningManager {
         -WindowStyle Normal -ErrorAction Stop | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $navigationDone = $false
+    $requestSent = $false
     while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-CodexDesktopRunning) { return }
+        if (Test-CodexDesktopRunning) {
+            Write-Host '已确认 Codex 桌面进程启动，继续等待调试端口。'
+            return
+        }
         $root = Get-CodexPlusManagerWindow -ManagerId $ManagerId
-        if ($root) {
-            if (Test-CodexDesktopRunning) { return }
+        if ($root -and -not $requestSent) {
             $button = Find-CodexPlusButton -Root $root -Names @('启动 Codex', 'Start Codex')
             if ($button) {
                 # 再次核对进程，避免启动期间重复触发。
                 if (Test-CodexDesktopRunning) { return }
-                $pattern = $button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
-                $pattern.Invoke()
+                # 请求提交后只等待结果，防止应用启动稍慢时重复点击。
+                $requestSent = $true
+                Invoke-CodexPlusControl -Element $button
                 Write-Host '已通过正在运行的 Codex++ 管理器请求启动 Codex。'
-                return
             }
-            if (-not $navigationDone) {
-                # 其他页面没有启动按钮时，进入 Codex 概览；不修改配置。
-                $nav = Find-CodexPlusButton -Root $root -Names @('Codex') -NamePattern '^Codex\s*[·•]'
-                if ($nav) {
-                    $nav.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
-                    $navigationDone = $true
-                }
+            elseif (-not $navigationDone) {
+                $navigationDone = Show-CodexPlusOverview -Root $root
             }
         }
         Start-Sleep -Milliseconds 500
     }
     # 失败时保留已经显示的管理器，方便查看状态并手动操作。
+    if ($requestSent) { throw '已请求启动 Codex，但等待后仍未检测到桌面进程，请查看 Codex++ 的启动错误。' }
     throw '未找到可用的“启动 Codex”按钮，已保留 Codex++ 界面，请在管理器中手动启动。'
 }
