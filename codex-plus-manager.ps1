@@ -65,6 +65,22 @@ function Show-CodexPlusOverview {
     return $true
 }
 
+function Get-CodexPlusLaunchState {
+    # 只读取启动状态及写入时间，区分本次请求的结果与上次残留的 stopped 状态。
+    $directory = if ($env:CODEX_PLUS_STATE_DIR) { $env:CODEX_PLUS_STATE_DIR }
+        else { Join-Path $env:USERPROFILE '.codex-session-delete' }
+    $path = Join-Path $directory 'latest-status.json'
+    try {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+        $writeTime = [IO.File]::GetLastWriteTimeUtc($path)
+        $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        # 管理器正在写文件时等待下一轮，避免把新时间和旧内容组合成错误结果。
+        if ([IO.File]::GetLastWriteTimeUtc($path) -ne $writeTime) { return $null }
+        return [pscustomobject]@{ Status = $state.status; Message = $state.message; WriteTimeUtc = $writeTime }
+    }
+    catch { return $null }
+}
+
 function Start-CodexViaRunningManager {
     param(
         [Parameter(Mandatory)][int]$ManagerId,
@@ -81,19 +97,35 @@ function Start-CodexViaRunningManager {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $navigationDone = $false
     $requestSent = $false
+    $requestCount = 0
+    $requestStateTime = [DateTime]::MinValue
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-CodexDesktopRunning) {
             Write-Host '已确认 Codex 桌面进程启动，继续等待调试端口。'
             return
         }
-        $root = Get-CodexPlusManagerWindow -ManagerId $ManagerId
-        if ($root -and -not $requestSent) {
+        $state = Get-CodexPlusLaunchState
+        if ($requestSent -and $state -and $state.WriteTimeUtc -gt $requestStateTime) {
+            if ($state.Status -eq 'failed') { throw "Codex++ 启动失败：$($state.Message)" }
+            if ($state.Status -eq 'stopped' -and $requestCount -lt 2) {
+                # 旧任务收尾时可能接走启动请求；它明确停止后才允许补发一次。
+                $requestSent = $false
+                $navigationDone = $false
+                Write-Host 'Codex++ 的旧任务已结束，重新请求启动 Codex。'
+            }
+        }
+        # 请求已经发出时只查进程和状态文件，避免反复扫描整个管理器界面。
+        $root = if (-not $requestSent) { Get-CodexPlusManagerWindow -ManagerId $ManagerId }
+        if ($root) {
             $button = Find-CodexPlusButton -Root $root -Names @('启动 Codex', 'Start Codex')
             if ($button) {
                 # 再次核对进程，避免启动期间重复触发。
                 if (Test-CodexDesktopRunning) { return }
-                # 请求提交后只等待结果，防止应用启动稍慢时重复点击。
+                # 记住点击前的文件时间；旧的 stopped 文件不能触发重试。
+                $beforeRequest = Get-CodexPlusLaunchState
+                $requestStateTime = if ($beforeRequest) { $beforeRequest.WriteTimeUtc } else { [DateTime]::MinValue }
                 $requestSent = $true
+                $requestCount++
                 Invoke-CodexPlusControl -Element $button
                 Write-Host '已通过正在运行的 Codex++ 管理器请求启动 Codex。'
             }
